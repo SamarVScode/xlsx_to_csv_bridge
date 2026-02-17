@@ -82,25 +82,30 @@ def perform_conversion_from_url(file_id: str, sheet_name: str | None, cache_path
     tmp_xlsx = CACHE_DIR / f"{file_id}.xlsx"
 
     try:
-        # 1. Stream download directly to disk (Critical for 100MB+ files)
-        response = session.get(download_url, headers=headers, stream=True)
-        if response.status_code == 200 and "confirm=" in response.text:
-            confirm_match = re.search(r'confirm=([a-zA-Z0-9_-]+)', response.text)
-            if confirm_match:
-                confirm_token = confirm_match.group(1)
-                download_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm={confirm_token}"
-                response = session.get(download_url, headers=headers, stream=True)
-        
-        response.raise_for_status()
-        with open(tmp_xlsx, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
+        # Check if source XLSX is already cached and fresh (e.g. < 10 mins)
+        if tmp_xlsx.exists() and (time.time() - tmp_xlsx.stat().st_mtime < 600):
+            print(f"Using cached source XLSX for {file_id}")
+        else:
+            print(f"Downloading source XLSX for {file_id}")
+            # 1. Stream download directly to disk (Critical for 100MB+ files)
+            response = session.get(download_url, headers=headers, stream=True)
+            if response.status_code == 200 and "confirm=" in response.text:
+                confirm_match = re.search(r'confirm=([a-zA-Z0-9_-]+)', response.text)
+                if confirm_match:
+                    confirm_token = confirm_match.group(1)
+                    download_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm={confirm_token}"
+                    response = session.get(download_url, headers=headers, stream=True)
+            
+            response.raise_for_status()
+            with open(tmp_xlsx, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
 
         # 2. Convert from disk
         convert_xlsx_to_csv(tmp_xlsx, sheet_name, cache_path)
         
-        # 3. Cleanup
-        if tmp_xlsx.exists(): tmp_xlsx.unlink()
+        # Note: We don't cleanup tmp_xlsx here anymore, so it's available for other sheet requests.
+        # It will be overwritten/refreshed after 10 minutes.
 
     except Exception as e:
         if tmp_xlsx.exists(): tmp_xlsx.unlink()
@@ -166,29 +171,42 @@ async def convert_endpoint(
     drive_url: str | None = Query(None),
     sheet_name: str | None = Query(None),
     api_key: str | None = Query(None),
-    x_api_key: str | None = Header(None, alias="X-API-KEY")
+    x_api_key: str | None = Header(None, alias="X-API-KEY"),
+    range_header: str | None = Header(None, alias="Range")
 ):
     # 1. Security Check
     provided_key = x_api_key or api_key
     if REQUIRED_API_KEY and provided_key != REQUIRED_API_KEY:
+        print(f"Auth Failed: Provided={provided_key}")
         raise HTTPException(status_code=403, detail="Unauthorized")
 
-    # 2. Extract params from either Body or Query
-    final_url = (request_data.drive_url if request_data else None) or drive_url
-    final_sheet = (request_data.sheet_name if request_data else None) or sheet_name
+    # 2. Extract params (Query params take priority for easier GAS integration)
+    final_url = drive_url or (request_data.drive_url if request_data else None)
+    final_sheet = sheet_name or (request_data.sheet_name if request_data else None)
 
     if not final_url:
         raise HTTPException(status_code=400, detail="drive_url is required")
 
     file_id = extract_file_id(final_url)
-    cache_key = hashlib.md5(f"{file_id}_{final_sheet}".encode()).hexdigest()
+    
+    # Clean sheet name for logging
+    clean_sheet_log = final_sheet if final_sheet else "First/Active Sheet"
+    print(f"Request: File={file_id}, Sheet={clean_sheet_log}")
+
+    # Create a unique cache key based on file ID and sheet name
+    cache_key_raw = f"{file_id}_{final_sheet}"
+    cache_key = hashlib.md5(cache_key_raw.encode()).hexdigest()
     cache_path = CACHE_DIR / f"{cache_key}.csv"
 
-    # 3. Check Cache
+    print(f"Cache Path: {cache_path}, Exists: {cache_path.exists()}")
+
+    # 3. Check Cache (valid for 10 minutes to support chunking)
     if not cache_path.exists() or (time.time() - cache_path.stat().st_mtime > 600):
+        print(f"Starting conversion for {file_id} - {clean_sheet_log}")
         perform_conversion_from_url(file_id, final_sheet, cache_path)
 
     total_size = cache_path.stat().st_size
+    print(f"Response Size: {total_size} bytes")
 
     # 4. Handle Range Request or Full Response
     if range_header:
