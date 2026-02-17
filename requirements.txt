@@ -4,3 +4,4 @@ pydantic
 requests
 openpyxl
 python-multipart
+lxml
