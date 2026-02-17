@@ -289,7 +289,7 @@ def perform_conversion_from_url(file_id: str, sheet_name: str | None, cache_path
                 for chunk in response.iter_content(chunk_size=8192):
                     f.write(chunk)
 
-        # 2. Convert from disk
+        # 2. Convert from disk with filtering
         convert_xlsx_to_csv(tmp_xlsx, sheet_name, cache_path)
         
         # Note: We don't cleanup tmp_xlsx here anymore, so it's available for other sheet requests.
@@ -300,50 +300,77 @@ def perform_conversion_from_url(file_id: str, sheet_name: str | None, cache_path
         if isinstance(e, HTTPException): raise e
         raise HTTPException(status_code=500, detail=f"Conversion failed: {str(e)}")
 
-def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: Path):
-    """Memory-efficient conversion using openpyxl read_only. Merges all sheets if None."""
+def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: Path, target_val: str = "MRZ", date_val: str | None = None):
+    """
+    Memory-efficient conversion and FILTERING. 
+    Finds "MRZ" rows in "Source_DC" or "DC" columns.
+    Adds a Date column if date_val is provided.
+    """
     try:
         wb = openpyxl.load_workbook(filename=str(xlsx_path), read_only=True, data_only=True)
         print(f"Workbook Details: Sheets={wb.sheetnames}")
         
-        # Normalize sheet_name_req (treat empty string as None)
         target_sheet = sheet_name_req if sheet_name_req and sheet_name_req.strip() else None
 
         sheets_to_process = []
         if target_sheet:
             target = target_sheet.strip().lower()
-            found = False
-            # Try exact match first
+            found_ws = None
             if target_sheet in wb.sheetnames:
-                sheets_to_process.append(wb[target_sheet])
-                found = True
+                found_ws = wb[target_sheet]
             else:
-                # Try case-insensitive, stripped match
                 for name in wb.sheetnames:
                     if name.strip().lower() == target:
-                        print(f"Found fuzzy match: '{name}' for '{target_sheet}'")
-                        sheets_to_process.append(wb[name])
-                        found = True
+                        found_ws = wb[name]
                         break
-            
-            if not found:
+            if not found_ws:
                 wb.close()
-                raise HTTPException(status_code=400, detail=f"Sheet '{target_sheet}' not found in {wb.sheetnames}")
+                raise HTTPException(status_code=400, detail=f"Sheet '{target_sheet}' not found")
+            sheets_to_process.append(found_ws)
         else:
-            print("No specific sheet requested. Merging ALL worksheets.")
             for name in wb.sheetnames:
                 sheets_to_process.append(wb[name])
 
-        # Export to CSV
+        first_sheet = True
         with open(csv_path, "w", encoding="utf-8", newline="") as f:
             writer = csv.writer(f)
+            
             for ws in sheets_to_process:
-                print(f"Processing sheet: {ws.title}")
-                for row in ws.iter_rows(values_only=True):
-                    writer.writerow(row)
+                print(f"Filtering sheet: {ws.title}")
+                rows_iter = ws.iter_rows(values_only=True)
+                
+                try:
+                    headers = next(rows_iter)
+                except StopIteration:
+                    continue
+
+                if not headers: continue
+                
+                # Identify column indices
+                col_map = {str(h).strip(): i for i, h in enumerate(headers) if h is not None}
+                target_idx = col_map.get("Source_DC")
+                if target_idx is None:
+                    target_idx = col_map.get("DC")
+
+                # Write headers only once
+                if first_sheet:
+                    header_list = list(headers)
+                    if date_val: header_list.append("Date")
+                    writer.writerow(header_list)
+                    first_sheet = False
+
+                if target_idx is not None:
+                    for row in rows_iter:
+                        if not row or len(row) <= target_idx: continue
+                        
+                        val = str(row[target_idx]).strip() if row[target_idx] is not None else ""
+                        if val == target_val:
+                            row_list = list(row)
+                            if date_val: row_list.append(date_val)
+                            writer.writerow(row_list)
         
         wb.close()
-        print("Conversion Complete.")
+        print("Filtering & Conversion Complete.")
     except Exception as e:
         if isinstance(e, HTTPException): raise e
         raise HTTPException(status_code=500, detail=f"XLSX Parse Error: {str(e)}")
@@ -351,8 +378,10 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
 @app.post("/test-upload")
 async def test_upload(
     file: UploadFile = File(...),
-    sheet_name: str | None = Query(None),
-    x_api_key: str | None = Header(None, alias="X-API-KEY")
+    sheet_name: Optional[str] = Query(None),
+    date_str: Optional[str] = Query(None),
+    target_value: str = Query("MRZ"),
+    x_api_key: Optional[str] = Header(None, alias="X-API-KEY")
 ):
     """Endpoint for manual testing via local file upload."""
     if REQUIRED_API_KEY and x_api_key != REQUIRED_API_KEY:
@@ -366,7 +395,7 @@ async def test_upload(
         with open(tmp_xlsx, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
         
-        convert_xlsx_to_csv(tmp_xlsx, sheet_name, cache_path)
+        convert_xlsx_to_csv(tmp_xlsx, sheet_name, cache_path, target_val=target_value, date_val=date_str)
         
         if tmp_xlsx.exists(): tmp_xlsx.unlink()
         
@@ -383,7 +412,9 @@ async def handle_conversion_request(
     drive_url: Optional[str],
     sheet_name: Optional[str],
     api_key_provided: Optional[str],
-    range_header: Optional[str]
+    range_header: Optional[str],
+    date_str: Optional[str] = None,
+    target_value: str = "MRZ"
 ):
     # 1. Security Check
     if REQUIRED_API_KEY and api_key_provided != REQUIRED_API_KEY:
@@ -396,18 +427,18 @@ async def handle_conversion_request(
     file_id = extract_file_id(drive_url)
     
     # Clean sheet name for logging
-    clean_sheet_log = sheet_name if sheet_name else "ALL_SHEETS_MERGED"
-    print(f"Request: File={file_id}, Sheet={clean_sheet_log}")
+    clean_sheet_log = sheet_name if sheet_name else "ALL_SHEETS_FILTERED"
+    print(f"Request: File={file_id}, Sheet={clean_sheet_log}, Target={target_value}")
 
-    # Create a unique cache key based on file ID and sheet name
-    cache_key_raw = f"{file_id}_{sheet_name}"
+    # Create a unique cache key based on params
+    cache_key_raw = f"{file_id}_{sheet_name}_{target_value}_{date_str}"
     cache_key = hashlib.md5(cache_key_raw.encode()).hexdigest()
     cache_path = CACHE_DIR / f"{cache_key}.csv"
 
-    # 3. Check Cache (valid for 10 minutes to support chunking)
+    # 3. Check Cache
     if not cache_path.exists() or (time.time() - cache_path.stat().st_mtime > 600):
-        print(f"Starting conversion for {file_id} - {clean_sheet_log}")
-        perform_conversion_from_url(file_id, sheet_name, cache_path)
+        print(f"Starting Filter & Conversion for {file_id}")
+        perform_conversion_from_url_with_filter(file_id, sheet_name, cache_path, target_value, date_str)
 
     total_size = cache_path.stat().st_size
     print(f"Response Size: {total_size} bytes")
@@ -448,10 +479,12 @@ async def convert_get(
     drive_url: Optional[str] = Query(None),
     sheet_name: Optional[str] = Query(None),
     api_key: Optional[str] = Query(None),
+    date_str: Optional[str] = Query(None),
+    target_value: str = Query("MRZ"),
     x_api_key: Optional[str] = Header(None, alias="X-API-KEY"),
     range_header: Optional[str] = Header(None, alias="Range")
 ):
-    return await handle_conversion_request(drive_url, sheet_name, x_api_key or api_key, range_header)
+    return await handle_conversion_request(drive_url, sheet_name, x_api_key or api_key, range_header, date_str, target_value)
 
 @app.post("/convert")
 async def convert_post(
@@ -459,12 +492,40 @@ async def convert_post(
     drive_url: Optional[str] = Query(None),
     sheet_name: Optional[str] = Query(None),
     api_key: Optional[str] = Query(None),
+    date_str: Optional[str] = Query(None),
+    target_value: str = Query("MRZ"),
     x_api_key: Optional[str] = Header(None, alias="X-API-KEY"),
     range_header: Optional[str] = Header(None, alias="Range")
 ):
     url = drive_url or (request_data.drive_url if request_data else None)
     sn = sheet_name or (request_data.sheet_name if request_data else None)
-    return await handle_conversion_request(url, sn, x_api_key or api_key, range_header)
+    return await handle_conversion_request(url, sn, x_api_key or api_key, range_header, date_str, target_value)
+
+def perform_conversion_from_url_with_filter(file_id: str, sheet_name: str | None, cache_path: Path, target_val: str, date_val: str | None):
+    """Refactored version of perform_conversion_from_url to carry filter params."""
+    session = requests.Session()
+    headers = {"User-Agent": "Mozilla/5.0"}
+    download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    tmp_xlsx = CACHE_DIR / f"{file_id}.xlsx"
+
+    try:
+        if not tmp_xlsx.exists() or (time.time() - tmp_xlsx.stat().st_mtime > 600):
+            print(f"Downloading source XLSX for {file_id}")
+            response = session.get(download_url, headers=headers, stream=True)
+            # Handle confirmation page
+            if "confirm=" in response.text:
+                token = re.search(r'confirm=([a-zA-Z0-9_-]+)', response.text).group(1)
+                download_url += f"&confirm={token}"
+                response = session.get(download_url, headers=headers, stream=True)
+            response.raise_for_status()
+            with open(tmp_xlsx, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+        convert_xlsx_to_csv(tmp_xlsx, sheet_name, cache_path, target_val, date_val)
+    except Exception as e:
+        if tmp_xlsx.exists(): tmp_xlsx.unlink()
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
