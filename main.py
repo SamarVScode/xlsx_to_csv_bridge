@@ -419,15 +419,21 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
                 try:
                     headers = next(rows_iter)
                 except StopIteration:
+                    print(f"Sheet {ws.title} is empty")
                     continue
 
-                if not headers: continue
+                if not headers: 
+                    print(f"Sheet {ws.title} has no headers")
+                    continue
                 
                 # Identify column indices
                 col_map = {str(h).strip(): i for i, h in enumerate(headers) if h is not None}
                 target_idx = col_map.get("Source_DC")
                 if target_idx is None:
                     target_idx = col_map.get("DC")
+
+                if target_idx is None:
+                    print(f"Warning: Neither 'Source_DC' nor 'DC' found in {ws.title}. Headers: {list(headers)[:10]}")
 
                 # Write headers only once
                 if first_sheet:
@@ -436,15 +442,22 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
                     writer.writerow(header_list)
                     first_sheet = False
 
-                if target_idx is not None:
-                    for row in rows_iter:
-                        if not row or len(row) <= target_idx: continue
-                        
+                row_count = 0
+                match_count = 0
+                for row in rows_iter:
+                    row_count += 1
+                    if row_count % 10000 == 0:
+                        print(f"Still working... Proccessed {row_count} rows in {ws.title} (Matches so far: {match_count})")
+                    
+                    if target_idx is not None and len(row) > target_idx:
                         val = str(row[target_idx]).strip() if row[target_idx] is not None else ""
                         if val == target_val:
+                            match_count += 1
                             row_list = list(row)
                             if date_val: row_list.append(date_val)
                             writer.writerow(row_list)
+                
+                print(f"Finished {ws.title}: {row_count} rows total, {match_count} matches.")
         
         wb.close()
         print("Filtering & Conversion Complete.")
