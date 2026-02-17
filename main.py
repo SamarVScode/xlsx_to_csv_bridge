@@ -8,7 +8,8 @@ import shutil
 import requests
 import openpyxl
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, Header, Query, UploadFile, File
+from typing import Optional
+from fastapi import FastAPI, HTTPException, Header, Query, UploadFile, File, Body
 from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -377,12 +378,12 @@ async def test_upload(
 @app.get("/convert")
 @app.post("/convert")
 async def convert_endpoint(
-    request_data: ConversionRequest | None = None,
-    drive_url: str | None = Query(None),
-    sheet_name: str | None = Query(None),
-    api_key: str | None = Query(None),
-    x_api_key: str | None = Header(None, alias="X-API-KEY"),
-    range_header: str | None = Header(None, alias="Range")
+    request_data: Optional[ConversionRequest] = Body(None),
+    drive_url: Optional[str] = Query(None),
+    sheet_name: Optional[str] = Query(None),
+    api_key: Optional[str] = Query(None),
+    x_api_key: Optional[str] = Header(None, alias="X-API-KEY"),
+    range_header: Optional[str] = Header(None, alias="Range")
 ):
     # 1. Security Check
     provided_key = x_api_key or api_key
@@ -457,4 +458,5 @@ async def convert_endpoint(
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
