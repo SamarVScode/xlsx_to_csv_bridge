@@ -296,38 +296,49 @@ def perform_conversion_from_url(file_id: str, sheet_name: str | None, cache_path
         raise HTTPException(status_code=500, detail=f"Conversion failed: {str(e)}")
 
 def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: Path):
-    """Memory-efficient conversion using openpyxl read_only."""
+    """Memory-efficient conversion using openpyxl read_only. Merges all sheets if None."""
     try:
         wb = openpyxl.load_workbook(filename=str(xlsx_path), read_only=True, data_only=True)
-        print(f"Workbook Sheets: {wb.sheetnames}")
+        print(f"Workbook Details: Sheets={wb.sheetnames}")
         
-        ws = None
-        if sheet_name_req:
-            target = sheet_name_req.strip().lower()
+        # Normalize sheet_name_req (treat empty string as None)
+        target_sheet = sheet_name_req if sheet_name_req and sheet_name_req.strip() else None
+
+        sheets_to_process = []
+        if target_sheet:
+            target = target_sheet.strip().lower()
+            found = False
             # Try exact match first
-            if sheet_name_req in wb.sheetnames:
-                ws = wb[sheet_name_req]
+            if target_sheet in wb.sheetnames:
+                sheets_to_process.append(wb[target_sheet])
+                found = True
             else:
                 # Try case-insensitive, stripped match
                 for name in wb.sheetnames:
                     if name.strip().lower() == target:
-                        print(f"Found fuzzy match: '{name}' for '{sheet_name_req}'")
-                        ws = wb[name]
+                        print(f"Found fuzzy match: '{name}' for '{target_sheet}'")
+                        sheets_to_process.append(wb[name])
+                        found = True
                         break
             
-            if not ws:
-                raise HTTPException(status_code=400, detail=f"Sheet '{sheet_name_req}' not found in {wb.sheetnames}")
+            if not found:
+                wb.close()
+                raise HTTPException(status_code=400, detail=f"Sheet '{target_sheet}' not found in {wb.sheetnames}")
         else:
-            print("No sheet name requested, using active sheet")
-            ws = wb.active
+            print("No specific sheet requested. Merging ALL worksheets.")
+            for name in wb.sheetnames:
+                sheets_to_process.append(wb[name])
 
-        print(f"Exporting sheet: {ws.title}")
+        # Export to CSV
         with open(csv_path, "w", encoding="utf-8", newline="") as f:
             writer = csv.writer(f)
-            for row in ws.iter_rows(values_only=True):
-                writer.writerow(row)
+            for ws in sheets_to_process:
+                print(f"Processing sheet: {ws.title}")
+                for row in ws.iter_rows(values_only=True):
+                    writer.writerow(row)
         
         wb.close()
+        print("Conversion Complete.")
     except Exception as e:
         if isinstance(e, HTTPException): raise e
         raise HTTPException(status_code=500, detail=f"XLSX Parse Error: {str(e)}")
@@ -379,15 +390,13 @@ async def convert_endpoint(
         print(f"Auth Failed: Provided={provided_key}")
         raise HTTPException(status_code=403, detail="Unauthorized")
 
-    # 2. Extract params (Query params take priority for easier GAS integration)
-    # Be explicit: Query params first, then check request_data if available
-    final_url = drive_url
-    if not final_url and request_data:
-        final_url = request_data.drive_url
-        
-    final_sheet = sheet_name
-    if not final_sheet and request_data:
-        final_sheet = request_data.sheet_name
+    # 2. Extract params (Normalize empty strings to None)
+    final_url = (drive_url or (request_data.drive_url if request_data else None))
+    final_sheet = (sheet_name or (request_data.sheet_name if request_data else None))
+    
+    # Handle empty strings from URL queries
+    if final_url == "": final_url = None
+    if final_sheet == "": final_sheet = None
 
     if not final_url:
         print("Error: Missing drive_url")
@@ -396,7 +405,7 @@ async def convert_endpoint(
     file_id = extract_file_id(final_url)
     
     # Clean sheet name for logging
-    clean_sheet_log = final_sheet if final_sheet else "First/Active Sheet"
+    clean_sheet_log = final_sheet if final_sheet else "ALL_SHEETS_MERGED"
     print(f"Request: File={file_id}, Sheet={clean_sheet_log}")
 
     # Create a unique cache key based on file ID and sheet name
