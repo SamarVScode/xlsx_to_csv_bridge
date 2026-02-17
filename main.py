@@ -29,10 +29,20 @@ def verify_api_key(x_api_key: str = Header(...)):
     return x_api_key
 
 def extract_file_id(url: str) -> str:
-    """Extracts the Google Drive file ID from a URL."""
+    """Extracts the Google Drive file ID from various URL formats."""
+    # Standard /d/ID format
     match = re.search(r"/d/([a-zA-Z0-9_-]+)", url)
     if match:
         return match.group(1)
+    # uc?id=ID format
+    match = re.search(r"id=([a-zA-Z0-9_-]+)", url)
+    if match:
+        return match.group(1)
+    # open?id=ID format
+    match = re.search(r"open\?id=([a-zA-Z0-9_-]+)", url)
+    if match:
+        return match.group(1)
+    
     raise HTTPException(status_code=400, detail="Could not extract File ID from URL")
 
 def parse_range_header(range_header: str, content_length: int):
@@ -62,18 +72,36 @@ async def convert_endpoint(
 
     file_id = extract_file_id(request.drive_url)
     
-    # 2. Download from Google Drive
-    download_url = f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=xlsx"
+    # 2. Download from Google Drive with large file handling
+    session = requests.Session()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+    
+    download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
 
     try:
-        response = requests.get(download_url)
+        # First attempt
+        response = session.get(download_url, headers=headers, stream=True)
+        
+        # If file is large, Google returns a confirmation page
+        if response.status_code == 200 and "confirm=" in response.text:
+            # Extract confirmation token
+            confirm_match = re.search(r'confirm=([a-zA-Z0-9_-]+)', response.text)
+            if confirm_match:
+                confirm_token = confirm_match.group(1)
+                download_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm={confirm_token}"
+                response = session.get(download_url, headers=headers, stream=True)
+
         response.raise_for_status()
+        content = response.content
     except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=400, detail=f"Failed to download file. Ensure it is accessible. Error: {str(e)}")
+        status = response.status_code if 'response' in locals() else 400
+        raise HTTPException(status_code=status, detail=f"Failed to download file. Error: {str(e)}")
 
     # 3. In-Memory Processing
     try:
-        file_content = io.BytesIO(response.content)
+        file_content = io.BytesIO(content)
         
         # Load specific sheet if requested, otherwise first sheet
         sheet_to_load = request.sheet_name if request.sheet_name else 0
