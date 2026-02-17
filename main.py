@@ -7,6 +7,7 @@ import hashlib
 import shutil
 import requests
 import xlsx2csv
+import traceback
 from pathlib import Path
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Header, Query, UploadFile, File, Body
@@ -429,21 +430,26 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
 
                     def write(self, data):
                         # xlsx2csv writes chunks of CSV-formatted text
+                        # Handle potential bytes from some xlsx2csv versions
+                        if isinstance(data, bytes):
+                            data = data.decode('utf-8', errors='ignore')
+                        
                         self.line_buffer += data
                         if "\n" in self.line_buffer:
-                            lines = self.line_buffer.split("\n")
-                            # Process all complete lines
-                            for line in lines[:-1]:
+                            # Split by newline, filter out empty, but keep remainder
+                            parts = self.line_buffer.split("\n")
+                            for line in parts[:-1]:
                                 if line.strip():
-                                    # Use csv.reader to parse the CSV text back into a list
-                                    reader = csv.reader([line])
                                     try:
+                                        # Parse CSV line safely
+                                        f_line = io.StringIO(line)
+                                        reader = csv.reader(f_line)
                                         row = next(reader)
                                         self.process_row_data(row)
-                                    except:
-                                        continue
-                            # Keep the remainder
-                            self.line_buffer = lines[-1]
+                                    except Exception as e:
+                                        # Silent fail for malformed lines
+                                        pass
+                            self.line_buffer = parts[-1]
 
                     def process_row_data(self, row):
                         self.row_count += 1
@@ -479,8 +485,9 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
                     
                     def finalize(self):
                         if self.line_buffer.strip():
-                            reader = csv.reader([self.line_buffer])
                             try:
+                                f_line = io.StringIO(self.line_buffer)
+                                reader = csv.reader(f_line)
                                 row = next(reader)
                                 self.process_row_data(row)
                             except:
@@ -488,13 +495,20 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
                         self.line_buffer = ""
 
                 f_output = FilteredOutput(writer, date_val, target_val, first_sheet_global)
-                xlsx2csv.Xlsx2csv(str(xlsx_path), skip_empty_lines=True).convert(f_output, sheetid=s_idx)
-                f_output.finalize()
-                print(f"Finished {s_name}: {f_output.row_count} rows, {f_output.match_count} matches.")
-                first_sheet_global = False
+                try:
+                    xlsx2csv.Xlsx2csv(str(xlsx_path), skip_empty_lines=True).convert(f_output, sheetid=s_idx)
+                    f_output.finalize()
+                    print(f"Finished {s_name}: {f_output.row_count} rows, {f_output.match_count} matches.")
+                    first_sheet_global = False
+                except Exception as e:
+                    print(f"Error processing sheet index {s_idx}: {str(e)}")
+                    traceback.print_exc()
+                    raise e
 
         print("Filtering & Conversion Complete.")
     except Exception as e:
+        print(f"CRITICAL CONVERSION ERROR: {str(e)}")
+        traceback.print_exc()
         if isinstance(e, HTTPException): raise e
         raise HTTPException(status_code=500, detail=f"Xlsx2csv Error: {str(e)}")
 
