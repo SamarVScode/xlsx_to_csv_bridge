@@ -19,11 +19,15 @@ app = FastAPI()
 # --- CORS Configuration ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
+
+print("\n" + "="*40)
+print("XLSX-to-CSV Bridge Starting...")
+print("="*40 + "\n")
 
 @app.get("/")
 async def root():
@@ -375,51 +379,35 @@ async def test_upload(
         if tmp_xlsx.exists(): tmp_xlsx.unlink()
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/convert")
-@app.post("/convert")
-async def convert_endpoint(
-    request_data: Optional[ConversionRequest] = Body(None),
-    drive_url: Optional[str] = Query(None),
-    sheet_name: Optional[str] = Query(None),
-    api_key: Optional[str] = Query(None),
-    x_api_key: Optional[str] = Header(None, alias="X-API-KEY"),
-    range_header: Optional[str] = Header(None, alias="Range")
+async def handle_conversion_request(
+    drive_url: Optional[str],
+    sheet_name: Optional[str],
+    api_key_provided: Optional[str],
+    range_header: Optional[str]
 ):
     # 1. Security Check
-    provided_key = x_api_key or api_key
-    if REQUIRED_API_KEY and provided_key != REQUIRED_API_KEY:
-        print(f"Auth Failed: Provided={provided_key}")
+    if REQUIRED_API_KEY and api_key_provided != REQUIRED_API_KEY:
+        print(f"Auth Failed: Provided={api_key_provided}")
         raise HTTPException(status_code=403, detail="Unauthorized")
 
-    # 2. Extract params (Normalize empty strings to None)
-    final_url = (drive_url or (request_data.drive_url if request_data else None))
-    final_sheet = (sheet_name or (request_data.sheet_name if request_data else None))
-    
-    # Handle empty strings from URL queries
-    if final_url == "": final_url = None
-    if final_sheet == "": final_sheet = None
-
-    if not final_url:
-        print("Error: Missing drive_url")
+    if not drive_url:
         raise HTTPException(status_code=400, detail="drive_url is required")
 
-    file_id = extract_file_id(final_url)
+    file_id = extract_file_id(drive_url)
     
     # Clean sheet name for logging
-    clean_sheet_log = final_sheet if final_sheet else "ALL_SHEETS_MERGED"
+    clean_sheet_log = sheet_name if sheet_name else "ALL_SHEETS_MERGED"
     print(f"Request: File={file_id}, Sheet={clean_sheet_log}")
 
     # Create a unique cache key based on file ID and sheet name
-    cache_key_raw = f"{file_id}_{final_sheet}"
+    cache_key_raw = f"{file_id}_{sheet_name}"
     cache_key = hashlib.md5(cache_key_raw.encode()).hexdigest()
     cache_path = CACHE_DIR / f"{cache_key}.csv"
-
-    print(f"Cache Path: {cache_path}, Exists: {cache_path.exists()}")
 
     # 3. Check Cache (valid for 10 minutes to support chunking)
     if not cache_path.exists() or (time.time() - cache_path.stat().st_mtime > 600):
         print(f"Starting conversion for {file_id} - {clean_sheet_log}")
-        perform_conversion_from_url(file_id, final_sheet, cache_path)
+        perform_conversion_from_url(file_id, sheet_name, cache_path)
 
     total_size = cache_path.stat().st_size
     print(f"Response Size: {total_size} bytes")
@@ -431,7 +419,6 @@ async def convert_endpoint(
         if start > end: raise HTTPException(status_code=416, detail="Range Not Satisfiable")
 
         chunk_size = end - start + 1
-        
         def iterfile():
             with open(cache_path, "rb") as f:
                 f.seek(start)
@@ -455,6 +442,29 @@ async def convert_endpoint(
             filename=f"{file_id}.csv",
             headers={"Accept-Ranges": "bytes"}
         )
+
+@app.get("/convert")
+async def convert_get(
+    drive_url: Optional[str] = Query(None),
+    sheet_name: Optional[str] = Query(None),
+    api_key: Optional[str] = Query(None),
+    x_api_key: Optional[str] = Header(None, alias="X-API-KEY"),
+    range_header: Optional[str] = Header(None, alias="Range")
+):
+    return await handle_conversion_request(drive_url, sheet_name, x_api_key or api_key, range_header)
+
+@app.post("/convert")
+async def convert_post(
+    request_data: Optional[ConversionRequest] = Body(None),
+    drive_url: Optional[str] = Query(None),
+    sheet_name: Optional[str] = Query(None),
+    api_key: Optional[str] = Query(None),
+    x_api_key: Optional[str] = Header(None, alias="X-API-KEY"),
+    range_header: Optional[str] = Header(None, alias="Range")
+):
+    url = drive_url or (request_data.drive_url if request_data else None)
+    sn = sheet_name or (request_data.sheet_name if request_data else None)
+    return await handle_conversion_request(url, sn, x_api_key or api_key, range_header)
 
 if __name__ == "__main__":
     import uvicorn
