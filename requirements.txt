@@ -2,6 +2,5 @@ fastapi
 uvicorn
 pydantic
 requests
-openpyxl
+xlsx2csv
 python-multipart
-lxml
