@@ -1,8 +1,9 @@
 import os
 import re
 import io
+import csv
 import requests
-import pandas as pd
+import openpyxl
 from fastapi import FastAPI, HTTPException, Header, Body
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -99,26 +100,36 @@ async def convert_endpoint(
         status = response.status_code if 'response' in locals() else 400
         raise HTTPException(status_code=status, detail=f"Failed to download file. Error: {str(e)}")
 
-    # 3. In-Memory Processing
+    # 3. Stream Processing (Memory Efficient)
     try:
-        file_content = io.BytesIO(content)
+        # Save bytes to a temporary seekable stream
+        xlsx_file = io.BytesIO(content)
         
-        # Load specific sheet if requested, otherwise first sheet
-        sheet_to_load = request.sheet_name if request.sheet_name else 0
+        # Open in read_only mode to stream rows
+        wb = openpyxl.load_workbook(xlsx_file, read_only=True, data_only=True)
+        
+        # Select sheet
+        if request.sheet_name:
+            if request.sheet_name not in wb.sheetnames:
+                raise HTTPException(status_code=400, detail=f"Sheet '{request.sheet_name}' not found")
+            ws = wb[request.sheet_name]
+        else:
+            ws = wb.active
 
-        try:
-            df = pd.read_excel(file_content, engine='openpyxl', sheet_name=sheet_to_load)
-        except ValueError as e:
-            # Handle "Worksheet not found" errors
-            raise HTTPException(status_code=400, detail=f"Sheet processing error: {str(e)}")
-        
-        # Convert to CSV
+        # Convert to CSV using a buffer
         output_buffer = io.StringIO()
-        df.to_csv(output_buffer, index=False)
-        output_buffer.seek(0)
+        csv_writer = csv.writer(output_buffer)
+
+        # Iterate through rows and write to buffer
+        for row in ws.iter_rows(values_only=True):
+            csv_writer.writerow(row)
         
         csv_bytes = output_buffer.getvalue().encode('utf-8')
         total_size = len(csv_bytes)
+        
+        # Cleanup
+        wb.close()
+        xlsx_file.close()
 
         # 4. Handle Range Request or Full Response
         if range_header:
