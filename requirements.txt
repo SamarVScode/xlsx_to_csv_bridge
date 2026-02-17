@@ -1,5 +1,6 @@
-openpyxl
-requests
 fastapi
 uvicorn
+pydantic
+requests
+openpyxl
 python-multipart
