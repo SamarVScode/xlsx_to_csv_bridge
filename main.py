@@ -115,9 +115,40 @@ async def test_page():
             white-space: pre-wrap;
             word-break: break-all;
         }
-        .success { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }
-        .error { background: #fee2e2; color: #991b1b; border: 1px solid #fecaca; }
-        .info { background: #e0f2fe; color: #075985; border: 1px solid #bae6fd; }
+        .progress-group {
+            margin-top: 1.5rem;
+            display: none;
+        }
+        .progress-label {
+            font-size: 0.875rem;
+            margin-bottom: 0.5rem;
+            display: flex;
+            justify-content: space-between;
+        }
+        .progress-bar-container {
+            width: 100%;
+            height: 10px;
+            background: #e2e8f0;
+            border-radius: 5px;
+            overflow: hidden;
+            margin-bottom: 1rem;
+        }
+        .progress-bar-fill {
+            height: 100%;
+            background: var(--primary);
+            width: 0%;
+            transition: width 0.3s;
+        }
+        .progress-bar-fill.indeterminate {
+            width: 100%;
+            background: linear-gradient(90deg, #2563eb 25%, #60a5fa 50%, #2563eb 75%);
+            background-size: 200% 100%;
+            animation: move-bg 1.5s infinite linear;
+        }
+        @keyframes move-bg {
+            0% { background-position: 200% 0; }
+            100% { background-position: -200% 0; }
+        }
     </style>
 </head>
 <body>
@@ -141,10 +172,27 @@ async def test_page():
 
         <div class="field">
             <label for="sheetName">Sheet Name (Optional)</label>
-            <input type="text" id="sheetName" placeholder="Defaults to First Sheet">
+            <input type="text" id="sheetName" placeholder="Defaults to All Sheets Merged">
         </div>
 
         <button id="testBtn">Upload & Convert to CSV</button>
+
+        <div class="progress-group" id="progressGroup">
+            <div class="progress-label">
+                <span>Uploading...</span>
+                <span id="uploadPct">0%</span>
+            </div>
+            <div class="progress-bar-container">
+                <div class="progress-bar-fill" id="uploadBar"></div>
+            </div>
+
+            <div class="progress-label" id="convertLabel" style="display:none">
+                <span>Converting & Filtering (Please Wait)...</span>
+            </div>
+            <div class="progress-bar-container" id="convertBarContainer" style="display:none">
+                <div class="progress-bar-fill indeterminate"></div>
+            </div>
+        </div>
 
         <div id="status"></div>
     </div>
@@ -155,6 +203,11 @@ async def test_page():
 
         const testBtn = document.getElementById('testBtn');
         const statusDiv = document.getElementById('status');
+        const progressGroup = document.getElementById('progressGroup');
+        const uploadBar = document.getElementById('uploadBar');
+        const uploadPct = document.getElementById('uploadPct');
+        const convertLabel = document.getElementById('convertLabel');
+        const convertBarContainer = document.getElementById('convertBarContainer');
 
         testBtn.addEventListener('click', async () => {
             const bridgeUrl = document.getElementById('bridgeUrl').value.trim();
@@ -173,37 +226,61 @@ async def test_page():
 
             const uploadUrl = `${bridgeUrl}/test-upload${sheetName ? `?sheet_name=${encodeURIComponent(sheetName)}` : ''}`;
 
-            showStatus('Converting... Please wait (90MB might take a moment).', 'info');
+            statusDiv.style.display = 'none';
+            progressGroup.style.display = 'block';
+            convertLabel.style.display = 'none';
+            convertBarContainer.style.display = 'none';
+            uploadBar.style.width = '0%';
+            uploadPct.textContent = '0%';
             testBtn.disabled = true;
 
-            try {
-                const response = await fetch(uploadUrl, {
-                    method: 'POST',
-                    headers: {
-                        'X-API-KEY': apiKey
-                    },
-                    body: formData
-                });
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', uploadUrl, true);
+            xhr.setRequestHeader('X-API-KEY', apiKey);
+            xhr.responseType = 'blob';
 
-                if (response.ok) {
-                    const blob = await response.blob();
+            xhr.upload.onprogress = (e) => {
+                if (e.lengthComputable) {
+                    const percent = Math.round((e.loaded / e.total) * 100);
+                    uploadBar.style.width = percent + '%';
+                    uploadPct.textContent = percent + '%';
+                    
+                    if (percent === 100) {
+                        setTimeout(() => {
+                            convertLabel.style.display = 'flex';
+                            convertBarContainer.style.display = 'block';
+                        }, 200);
+                    }
+                }
+            };
+
+            xhr.onload = async () => {
+                progressGroup.style.display = 'none';
+                if (xhr.status >= 200 && xhr.status < 300) {
+                    const blob = xhr.response;
                     const url = window.URL.createObjectURL(blob);
                     const a = document.createElement('a');
                     a.href = url;
-                    a.download = `${file.name.replace('.xlsx', '')}.csv`;
+                    a.download = `${file.name.replace('.xlsx', '')}_filtered.csv`;
                     document.body.appendChild(a);
                     a.click();
                     a.remove();
-                    showStatus('Success! CSV file has been downloaded.', 'success');
+                    showStatus('Success! Filtered CSV has been downloaded.', 'success');
                 } else {
-                    const errorText = await response.text();
-                    showStatus(`Error ${response.status}: ${errorText}`, 'error');
+                    const reader = new FileReader();
+                    reader.onload = () => showStatus(`Error ${xhr.status}: ${reader.result}`, 'error');
+                    reader.readAsText(xhr.response);
                 }
-            } catch (err) {
-                showStatus(`Network Error: ${err.message}`, 'error');
-            } finally {
                 testBtn.disabled = false;
-            }
+            };
+
+            xhr.onerror = () => {
+                progressGroup.style.display = 'none';
+                showStatus('Network Error during upload.', 'error');
+                testBtn.disabled = false;
+            };
+
+            xhr.send(formData);
         });
 
         function showStatus(message, type) {
