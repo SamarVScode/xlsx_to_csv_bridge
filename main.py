@@ -391,6 +391,7 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
         print(f"Workbook Details: Sheets={sheet_names}")
         
         target_indices = [] # Holds indices (1-based for xlsx2csv)
+        is_multi_request = False
         
         if sheet_name_req and sheet_name_req.strip():
             target = sheet_name_req.strip().lower()
@@ -402,10 +403,12 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
             if found_idx is None:
                 raise HTTPException(status_code=400, detail=f"Sheet '{sheet_name_req}' not found")
             target_indices.append(found_idx)
+            is_multi_request = False
         else:
             # Process all sheets
             for s in sheet_info:
                 target_indices.append(s['index'])
+            is_multi_request = True
 
         first_sheet_global = True
         with open(csv_path, "w", encoding="utf-8", newline="") as f_out:
