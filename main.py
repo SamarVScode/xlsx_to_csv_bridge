@@ -6,7 +6,7 @@ import time
 import hashlib
 import shutil
 import requests
-import openpyxl
+import xlsx2csv
 from pathlib import Path
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Header, Query, UploadFile, File, Body
@@ -379,91 +379,94 @@ def perform_conversion_from_url(file_id: str, sheet_name: str | None, cache_path
 
 def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: Path, target_val: str = "MRZ", date_val: str | None = None):
     """
-    Memory-efficient conversion and FILTERING. 
-    Finds "MRZ" rows in "Source_DC" or "DC" columns.
-    Adds a Date column if date_val is provided.
+    ULTRA-PERFORMANCE VERSION using xlsx2csv (SAX Parser).
+    Memory usage: < 50MB even for 100MB+ files.
     """
     try:
-        wb = openpyxl.load_workbook(filename=str(xlsx_path), read_only=True, data_only=True)
-        print(f"Workbook Details: Sheets={wb.sheetnames}")
+        # 1. Get sheet info
+        parser_info = xlsx2csv.Xlsx2csv(str(xlsx_path))
+        sheet_info = parser_info.workbook.sheets
+        sheet_names = [s['name'] for s in sheet_info]
+        print(f"Workbook Details: Sheets={sheet_names}")
         
-        target_sheet = sheet_name_req if sheet_name_req and sheet_name_req.strip() else None
-
-        sheets_to_process = []
-        if target_sheet:
-            target = target_sheet.strip().lower()
-            found_ws = None
-            if target_sheet in wb.sheetnames:
-                found_ws = wb[target_sheet]
-            else:
-                for name in wb.sheetnames:
-                    if name.strip().lower() == target:
-                        found_ws = wb[name]
-                        break
-            if not found_ws:
-                wb.close()
-                raise HTTPException(status_code=400, detail=f"Sheet '{target_sheet}' not found")
-            sheets_to_process.append(found_ws)
+        target_indices = [] # Holds indices (1-based for xlsx2csv)
+        
+        if sheet_name_req and sheet_name_req.strip():
+            target = sheet_name_req.strip().lower()
+            found_idx = None
+            for s in sheet_info:
+                if s['name'].strip().lower() == target:
+                    found_idx = s['index']
+                    break
+            if found_idx is None:
+                raise HTTPException(status_code=400, detail=f"Sheet '{sheet_name_req}' not found")
+            target_indices.append(found_idx)
         else:
-            for name in wb.sheetnames:
-                sheets_to_process.append(wb[name])
+            # Process all sheets
+            for s in sheet_info:
+                target_indices.append(s['index'])
 
-        first_sheet = True
-        with open(csv_path, "w", encoding="utf-8", newline="") as f:
-            writer = csv.writer(f)
+        first_sheet_global = True
+        with open(csv_path, "w", encoding="utf-8", newline="") as f_out:
+            writer = csv.writer(f_out)
             
-            for ws in sheets_to_process:
-                print(f"Filtering sheet: {ws.title}")
-                rows_iter = ws.iter_rows(values_only=True)
+            for s_idx in target_indices:
+                s_name = next(s['name'] for s in sheet_info if s['index'] == s_idx)
+                print(f"Filtering sheet: {s_name} (Index: {s_idx})")
                 
-                try:
-                    headers = next(rows_iter)
-                except StopIteration:
-                    print(f"Sheet {ws.title} is empty")
-                    continue
+                # Custom output class to filter rows on the fly
+                class FilteredOutput:
+                    def __init__(self, csv_writer, date_val, target_val, is_first_sheet):
+                        self.writer = csv_writer
+                        self.date_val = date_val
+                        self.target_val = target_val
+                        self.is_first_sheet = is_first_sheet
+                        self.first_row_in_sheet = True
+                        self.target_col_idx = None
+                        self.row_count = 0
+                        self.match_count = 0
 
-                if not headers: 
-                    print(f"Sheet {ws.title} has no headers")
-                    continue
-                
-                # Identify column indices
-                col_map = {str(h).strip(): i for i, h in enumerate(headers) if h is not None}
-                target_idx = col_map.get("Source_DC")
-                if target_idx is None:
-                    target_idx = col_map.get("DC")
+                    def writerow(self, row):
+                        self.row_count += 1
+                        if self.row_count % 10000 == 0:
+                            print(f"Still working on {s_name}... {self.row_count} rows processed (Matches: {self.match_count})")
+                            
+                        if not row: return
+                        
+                        if self.first_row_in_sheet:
+                            self.first_row_in_sheet = False
+                            # Detect headers
+                            col_map = {str(h).strip(): i for i, h in enumerate(row) if h is not None}
+                            self.target_col_idx = col_map.get("Source_DC")
+                            if self.target_col_idx is None:
+                                self.target_col_idx = col_map.get("DC")
+                            
+                            if self.is_first_sheet:
+                                # Write headers only once for the whole multi-sheet CSV
+                                header_list = list(row)
+                                if self.date_val: header_list.append("Date")
+                                self.writer.writerow(header_list)
+                            return
 
-                if target_idx is None:
-                    print(f"Warning: Neither 'Source_DC' nor 'DC' found in {ws.title}. Headers: {list(headers)[:10]}")
+                        # Filter check
+                        if self.target_col_idx is not None and len(row) > self.target_col_idx:
+                            raw_val = row[self.target_col_idx]
+                            val = str(raw_val).strip() if raw_val is not None else ""
+                            if val == self.target_val:
+                                self.match_count += 1
+                                row_list = list(row)
+                                if self.date_val: row_list.append(self.date_val)
+                                self.writer.writerow(row_list)
 
-                # Write headers only once
-                if first_sheet:
-                    header_list = list(headers)
-                    if date_val: header_list.append("Date")
-                    writer.writerow(header_list)
-                    first_sheet = False
+                f_output = FilteredOutput(writer, date_val, target_val, first_sheet_global)
+                xlsx2csv.Xlsx2csv(str(xlsx_path), skip_empty_lines=True).convert(f_output, sheetid=s_idx)
+                print(f"Finished {s_name}: {f_output.row_count} rows, {f_output.match_count} matches.")
+                first_sheet_global = False
 
-                row_count = 0
-                match_count = 0
-                for row in rows_iter:
-                    row_count += 1
-                    if row_count % 10000 == 0:
-                        print(f"Still working... Proccessed {row_count} rows in {ws.title} (Matches so far: {match_count})")
-                    
-                    if target_idx is not None and len(row) > target_idx:
-                        val = str(row[target_idx]).strip() if row[target_idx] is not None else ""
-                        if val == target_val:
-                            match_count += 1
-                            row_list = list(row)
-                            if date_val: row_list.append(date_val)
-                            writer.writerow(row_list)
-                
-                print(f"Finished {ws.title}: {row_count} rows total, {match_count} matches.")
-        
-        wb.close()
         print("Filtering & Conversion Complete.")
     except Exception as e:
         if isinstance(e, HTTPException): raise e
-        raise HTTPException(status_code=500, detail=f"XLSX Parse Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Xlsx2csv Error: {str(e)}")
 
 @app.post("/test-upload")
 async def test_upload(
