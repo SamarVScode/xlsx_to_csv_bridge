@@ -468,7 +468,7 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
                             
                             if self.is_first_sheet:
                                 # Write headers only once for the whole multi-sheet CSV
-                                header_list = list(row)
+                                header_list = ["Sheet"] + list(row)
                                 if self.date_val: header_list.append("Date")
                                 self.writer.writerow(header_list)
                             return
@@ -479,7 +479,8 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
                             val = str(raw_val).strip() if raw_val is not None else ""
                             if val == self.target_val:
                                 self.match_count += 1
-                                row_list = list(row)
+                                # Prepend sheet name to the row
+                                row_list = [s_name] + list(row)
                                 if self.date_val: row_list.append(self.date_val)
                                 self.writer.writerow(row_list)
                     
