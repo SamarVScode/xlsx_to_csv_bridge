@@ -425,8 +425,27 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
                         self.target_col_idx = None
                         self.row_count = 0
                         self.match_count = 0
+                        self.line_buffer = ""
 
-                    def writerow(self, row):
+                    def write(self, data):
+                        # xlsx2csv writes chunks of CSV-formatted text
+                        self.line_buffer += data
+                        if "\n" in self.line_buffer:
+                            lines = self.line_buffer.split("\n")
+                            # Process all complete lines
+                            for line in lines[:-1]:
+                                if line.strip():
+                                    # Use csv.reader to parse the CSV text back into a list
+                                    reader = csv.reader([line])
+                                    try:
+                                        row = next(reader)
+                                        self.process_row_data(row)
+                                    except:
+                                        continue
+                            # Keep the remainder
+                            self.line_buffer = lines[-1]
+
+                    def process_row_data(self, row):
                         self.row_count += 1
                         if self.row_count % 10000 == 0:
                             print(f"Still working on {s_name}... {self.row_count} rows processed (Matches: {self.match_count})")
@@ -457,9 +476,20 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
                                 row_list = list(row)
                                 if self.date_val: row_list.append(self.date_val)
                                 self.writer.writerow(row_list)
+                    
+                    def finalize(self):
+                        if self.line_buffer.strip():
+                            reader = csv.reader([self.line_buffer])
+                            try:
+                                row = next(reader)
+                                self.process_row_data(row)
+                            except:
+                                pass
+                        self.line_buffer = ""
 
                 f_output = FilteredOutput(writer, date_val, target_val, first_sheet_global)
                 xlsx2csv.Xlsx2csv(str(xlsx_path), skip_empty_lines=True).convert(f_output, sheetid=s_idx)
+                f_output.finalize()
                 print(f"Finished {s_name}: {f_output.row_count} rows, {f_output.match_count} matches.")
                 first_sheet_global = False
 
