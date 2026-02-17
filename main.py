@@ -112,18 +112,33 @@ def perform_conversion_from_url(file_id: str, sheet_name: str | None, cache_path
         if isinstance(e, HTTPException): raise e
         raise HTTPException(status_code=500, detail=f"Conversion failed: {str(e)}")
 
-def convert_xlsx_to_csv(xlsx_path: Path, sheet_name: str | None, csv_path: Path):
+def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: Path):
     """Memory-efficient conversion using openpyxl read_only."""
     try:
         wb = openpyxl.load_workbook(filename=str(xlsx_path), read_only=True, data_only=True)
+        print(f"Workbook Sheets: {wb.sheetnames}")
         
-        if sheet_name:
-            if sheet_name not in wb.sheetnames:
-                raise HTTPException(status_code=400, detail=f"Sheet '{sheet_name}' not found")
-            ws = wb[sheet_name]
+        ws = None
+        if sheet_name_req:
+            target = sheet_name_req.strip().lower()
+            # Try exact match first
+            if sheet_name_req in wb.sheetnames:
+                ws = wb[sheet_name_req]
+            else:
+                # Try case-insensitive, stripped match
+                for name in wb.sheetnames:
+                    if name.strip().lower() == target:
+                        print(f"Found fuzzy match: '{name}' for '{sheet_name_req}'")
+                        ws = wb[name]
+                        break
+            
+            if not ws:
+                raise HTTPException(status_code=400, detail=f"Sheet '{sheet_name_req}' not found in {wb.sheetnames}")
         else:
+            print("No sheet name requested, using active sheet")
             ws = wb.active
 
+        print(f"Exporting sheet: {ws.title}")
         with open(csv_path, "w", encoding="utf-8", newline="") as f:
             writer = csv.writer(f)
             for row in ws.iter_rows(values_only=True):
@@ -131,6 +146,7 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name: str | None, csv_path: Path)
         
         wb.close()
     except Exception as e:
+        if isinstance(e, HTTPException): raise e
         raise HTTPException(status_code=500, detail=f"XLSX Parse Error: {str(e)}")
 
 @app.post("/test-upload")
@@ -181,10 +197,17 @@ async def convert_endpoint(
         raise HTTPException(status_code=403, detail="Unauthorized")
 
     # 2. Extract params (Query params take priority for easier GAS integration)
-    final_url = drive_url or (request_data.drive_url if request_data else None)
-    final_sheet = sheet_name or (request_data.sheet_name if request_data else None)
+    # Be explicit: Query params first, then check request_data if available
+    final_url = drive_url
+    if not final_url and request_data:
+        final_url = request_data.drive_url
+        
+    final_sheet = sheet_name
+    if not final_sheet and request_data:
+        final_sheet = request_data.sheet_name
 
     if not final_url:
+        print("Error: Missing drive_url")
         raise HTTPException(status_code=400, detail="drive_url is required")
 
     file_id = extract_file_id(final_url)
