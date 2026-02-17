@@ -9,7 +9,7 @@ import requests
 import openpyxl
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Header, Query, UploadFile, File
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -26,7 +26,190 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
-    return {"status": "ready", "message": "XLSX-to-CSV Bridge is running"}
+    return {"status": "ready", "message": "XLSX-to-CSV Bridge is running. Visit /test for the UI."}
+
+@app.get("/test", response_class=HTMLResponse)
+async def test_page():
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>XLSX-to-CSV Bridge Test Bench</title>
+    <style>
+        :root {
+            --primary: #2563eb;
+            --bg: #f8fafc;
+            --card: #ffffff;
+            --text: #1e293b;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: var(--bg);
+            color: var(--text);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+        }
+        .container {
+            background: var(--card);
+            padding: 2rem;
+            border-radius: 1rem;
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1);
+            width: 100%;
+            max-width: 500px;
+        }
+        h1 {
+            font-size: 1.5rem;
+            margin-bottom: 1.5rem;
+            text-align: center;
+            color: var(--primary);
+        }
+        .field {
+            margin-bottom: 1rem;
+        }
+        label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-weight: 600;
+        }
+        input[type="text"], input[type="file"] {
+            width: 100%;
+            padding: 0.75rem;
+            border: 1px solid #cbd5e1;
+            border-radius: 0.5rem;
+            box-sizing: border-box;
+        }
+        button {
+            width: 100%;
+            padding: 0.75rem;
+            background-color: var(--primary);
+            color: white;
+            border: none;
+            border-radius: 0.5rem;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        button:hover {
+            background-color: #1d4ed8;
+        }
+        button:disabled {
+            background-color: #94a3b8;
+            cursor: not-allowed;
+        }
+        #status {
+            margin-top: 1.5rem;
+            padding: 1rem;
+            border-radius: 0.5rem;
+            display: none;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+        .success { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }
+        .error { background: #fee2e2; color: #991b1b; border: 1px solid #fecaca; }
+        .info { background: #e0f2fe; color: #075985; border: 1px solid #bae6fd; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>XLSX-to-CSV Bridge Tester</h1>
+        
+        <div class="field">
+            <label for="bridgeUrl">Bridge Base URL</label>
+            <input type="text" id="bridgeUrl" readonly value="">
+        </div>
+
+        <div class="field">
+            <label for="apiKey">X-API-KEY</label>
+            <input type="text" id="apiKey" value="a9F3kL8xQ2mZ7pR4tV6yH1nW5cX8bD0sE3uJ9gK2qL6zT4vY7">
+        </div>
+
+        <div class="field">
+            <label for="fileInput">Select XLSX File (up to 100MB+)</label>
+            <input type="file" id="fileInput" accept=".xlsx">
+        </div>
+
+        <div class="field">
+            <label for="sheetName">Sheet Name (Optional)</label>
+            <input type="text" id="sheetName" placeholder="Defaults to First Sheet">
+        </div>
+
+        <button id="testBtn">Upload & Convert to CSV</button>
+
+        <div id="status"></div>
+    </div>
+
+    <script>
+        // Auto-detect current host
+        document.getElementById('bridgeUrl').value = window.location.origin;
+
+        const testBtn = document.getElementById('testBtn');
+        const statusDiv = document.getElementById('status');
+
+        testBtn.addEventListener('click', async () => {
+            const bridgeUrl = document.getElementById('bridgeUrl').value.trim();
+            const apiKey = document.getElementById('apiKey').value.trim();
+            const fileInput = document.getElementById('fileInput');
+            const sheetName = document.getElementById('sheetName').value.trim();
+
+            if (!fileInput.files.length) {
+                showStatus('Please select a file first.', 'error');
+                return;
+            }
+
+            const file = fileInput.files[0];
+            const formData = new FormData();
+            formData.append('file', file);
+
+            const uploadUrl = `${bridgeUrl}/test-upload${sheetName ? `?sheet_name=${encodeURIComponent(sheetName)}` : ''}`;
+
+            showStatus('Converting... Please wait (90MB might take a moment).', 'info');
+            testBtn.disabled = true;
+
+            try {
+                const response = await fetch(uploadUrl, {
+                    method: 'POST',
+                    headers: {
+                        'X-API-KEY': apiKey
+                    },
+                    body: formData
+                });
+
+                if (response.ok) {
+                    const blob = await response.blob();
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `${file.name.replace('.xlsx', '')}.csv`;
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                    showStatus('Success! CSV file has been downloaded.', 'success');
+                } else {
+                    const errorText = await response.text();
+                    showStatus(`Error ${response.status}: ${errorText}`, 'error');
+                }
+            } catch (err) {
+                showStatus(`Network Error: ${err.message}`, 'error');
+            } finally {
+                testBtn.disabled = false;
+            }
+        });
+
+        function showStatus(message, type) {
+            statusDiv.textContent = message;
+            statusDiv.className = type;
+            statusDiv.style.display = 'block';
+        }
+    </script>
+</body>
+</html>
+"""
 
 # --- Configuration ---
 API_KEY_NAME = "X-API-KEY"
