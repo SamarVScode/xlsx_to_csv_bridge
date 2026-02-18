@@ -391,7 +391,6 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
         print(f"Workbook Details: Sheets={sheet_names}")
         
         target_indices = [] # Holds indices (1-based for xlsx2csv)
-        is_multi_request = False
         
         if sheet_name_req and sheet_name_req.strip():
             target = sheet_name_req.strip().lower()
@@ -403,14 +402,11 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
             if found_idx is None:
                 raise HTTPException(status_code=400, detail=f"Sheet '{sheet_name_req}' not found")
             target_indices.append(found_idx)
-            is_multi_request = False
         else:
             # Process all sheets
             for s in sheet_info:
                 target_indices.append(s['index'])
-            is_multi_request = True
 
-        first_sheet_global = True
         with open(csv_path, "w", encoding="utf-8", newline="") as f_out:
             writer = csv.writer(f_out)
             
@@ -420,11 +416,11 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
                 
                 # Custom output class to filter rows on the fly
                 class FilteredOutput:
-                    def __init__(self, csv_writer, date_val, target_val, is_first_sheet):
+                    def __init__(self, csv_writer, date_val, target_val, sheet_name):
                         self.writer = csv_writer
                         self.date_val = date_val
                         self.target_val = target_val
-                        self.is_first_sheet = is_first_sheet
+                        self.sheet_name = sheet_name
                         self.first_row_in_sheet = True
                         self.target_col_idx = None
                         self.row_count = 0
@@ -469,11 +465,10 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
                             if self.target_col_idx is None:
                                 self.target_col_idx = col_map.get("DC")
                             
-                            if self.is_first_sheet:
-                                # Write headers only once for the whole multi-sheet CSV
-                                header_list = ["Sheet"] + list(row)
-                                if self.date_val: header_list.append("Date")
-                                self.writer.writerow(header_list)
+                            # Write headers for EVERY sheet (different sheets have different columns)
+                            header_list = ["Sheet"] + list(row)
+                            if self.date_val: header_list.append("Date")
+                            self.writer.writerow(header_list)
                             return
 
                         # Filter check
@@ -498,12 +493,12 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
                                 pass
                         self.line_buffer = ""
 
-                f_output = FilteredOutput(writer, date_val, target_val, first_sheet_global)
+                f_output = FilteredOutput(writer, date_val, target_val, s_name)
                 try:
                     xlsx2csv.Xlsx2csv(str(xlsx_path), skip_empty_lines=True).convert(f_output, sheetid=s_idx)
                     f_output.finalize()
                     print(f"Finished {s_name}: {f_output.row_count} rows, {f_output.match_count} matches.")
-                    first_sheet_global = False
+
                 except Exception as e:
                     print(f"Error processing sheet index {s_idx}: {str(e)}")
                     traceback.print_exc()
