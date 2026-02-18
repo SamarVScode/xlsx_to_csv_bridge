@@ -4,9 +4,11 @@ import io
 import csv
 import sys
 import time
+import uuid
 import hashlib
 import shutil
 import logging
+import threading
 import requests
 import xlsx2csv
 import traceback
@@ -311,6 +313,10 @@ API_KEY_NAME = "X-API-KEY"
 REQUIRED_API_KEY = os.getenv("API_KEY")
 CACHE_DIR = Path("/tmp/xlsx_cache")
 CACHE_DIR.mkdir(exist_ok=True)
+CACHE_TTL = 1800  # 30 minutes (was 600s / 10 min)
+
+# --- Async Job Store ---
+active_jobs = {}  # { job_id: { status, cache_path, error, progress } }
 
 class ConversionRequest(BaseModel):
     drive_url: str
@@ -361,7 +367,7 @@ def perform_conversion_from_url(file_id: str, sheet_name: str | None, cache_path
 
     try:
         # Check if source XLSX is already cached and fresh (e.g. < 10 mins)
-        if tmp_xlsx.exists() and (time.time() - tmp_xlsx.stat().st_mtime < 600):
+        if tmp_xlsx.exists() and (time.time() - tmp_xlsx.stat().st_mtime < CACHE_TTL):
             log.info(f"[CACHE] Using cached source XLSX for {file_id}")
         else:
             log.info(f"[DOWNLOAD] Starting download for {file_id}...")
@@ -594,7 +600,7 @@ async def handle_conversion_request(
     cache_path = CACHE_DIR / f"{cache_key}.csv"
 
     # 3. Check Cache
-    if not cache_path.exists() or (time.time() - cache_path.stat().st_mtime > 600):
+    if not cache_path.exists() or (time.time() - cache_path.stat().st_mtime > CACHE_TTL):
         log.info(f"[REQUEST] 🔄 Cache miss — starting filter & conversion for {file_id}")
         perform_conversion_from_url_with_filter(file_id, sheet_name, cache_path, target_value, date_str)
 
@@ -667,7 +673,7 @@ def perform_conversion_from_url_with_filter(file_id: str, sheet_name: str | None
     tmp_xlsx = CACHE_DIR / f"{file_id}.xlsx"
 
     try:
-        if not tmp_xlsx.exists() or (time.time() - tmp_xlsx.stat().st_mtime > 600):
+        if not tmp_xlsx.exists() or (time.time() - tmp_xlsx.stat().st_mtime > CACHE_TTL):
             log.info(f"[DOWNLOAD] Starting download for {file_id}...")
             response = session.get(download_url, headers=headers, stream=True)
             # Handle confirmation page
@@ -684,6 +690,88 @@ def perform_conversion_from_url_with_filter(file_id: str, sheet_name: str | None
     except Exception as e:
         if tmp_xlsx.exists(): tmp_xlsx.unlink()
         raise HTTPException(status_code=500, detail=str(e))
+
+# =============================================================================
+# ASYNC JOB SYSTEM (for GAS which has a 6-min UrlFetchApp timeout)
+# =============================================================================
+
+@app.get("/convert-async")
+async def convert_async(
+    drive_url: Optional[str] = Query(None),
+    sheet_name: Optional[str] = Query(None),
+    date_str: Optional[str] = Query(None),
+    target_value: str = Query("MRZ"),
+    x_api_key: Optional[str] = Header(None, alias="X-API-KEY"),
+    api_key: Optional[str] = Query(None),
+):
+    """Starts conversion in background, returns job_id immediately."""
+    key = x_api_key or api_key
+    if REQUIRED_API_KEY and key != REQUIRED_API_KEY:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    if not drive_url:
+        raise HTTPException(status_code=400, detail="drive_url is required")
+
+    file_id = extract_file_id(drive_url)
+    job_id = str(uuid.uuid4())[:8]
+
+    # Build cache key
+    cache_key_raw = f"{file_id}_{sheet_name}_{target_value}_{date_str}"
+    cache_key = hashlib.md5(cache_key_raw.encode()).hexdigest()
+    cache_path = CACHE_DIR / f"{cache_key}.csv"
+
+    # If result is already cached, return immediately
+    if cache_path.exists() and (time.time() - cache_path.stat().st_mtime < CACHE_TTL):
+        log.info(f"[ASYNC] Job {job_id}: cache hit, returning done immediately")
+        active_jobs[job_id] = {"status": "done", "cache_path": str(cache_path), "error": None, "progress": "Cached"}
+        return {"job_id": job_id, "status": "done"}
+
+    # Start background thread
+    active_jobs[job_id] = {"status": "processing", "cache_path": str(cache_path), "error": None, "progress": "Starting..."}
+    log.info(f"[ASYNC] Job {job_id}: starting background conversion for {file_id}")
+
+    thread = threading.Thread(
+        target=background_conversion,
+        args=(job_id, file_id, sheet_name, cache_path, target_value, date_str),
+        daemon=True
+    )
+    thread.start()
+
+    return {"job_id": job_id, "status": "processing"}
+
+def background_conversion(job_id, file_id, sheet_name, cache_path, target_val, date_val):
+    """Runs in a background thread. Updates active_jobs on completion."""
+    try:
+        active_jobs[job_id]["progress"] = "Downloading XLSX..."
+        perform_conversion_from_url_with_filter(file_id, sheet_name, cache_path, target_val, date_val)
+        active_jobs[job_id]["status"] = "done"
+        active_jobs[job_id]["progress"] = "Complete"
+        log.info(f"[ASYNC] Job {job_id}: ✅ completed successfully")
+    except Exception as e:
+        active_jobs[job_id]["status"] = "error"
+        active_jobs[job_id]["error"] = str(e)
+        active_jobs[job_id]["progress"] = f"Failed: {str(e)}"
+        log.error(f"[ASYNC] Job {job_id}: ❌ failed — {str(e)}")
+
+@app.get("/job/{job_id}")
+async def job_status(job_id: str):
+    """Check the status of an async conversion job."""
+    job = active_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found (server may have restarted)")
+    return {"job_id": job_id, "status": job["status"], "progress": job["progress"], "error": job["error"]}
+
+@app.get("/job/{job_id}/result")
+async def job_result(job_id: str):
+    """Download the CSV result of a completed async job."""
+    job = active_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job["status"] != "done":
+        raise HTTPException(status_code=400, detail=f"Job not ready. Status: {job['status']}")
+    cache_path = Path(job["cache_path"])
+    if not cache_path.exists():
+        raise HTTPException(status_code=410, detail="Result file expired")
+    return FileResponse(cache_path, media_type="text/csv", filename=f"{job_id}.csv", headers={"Accept-Ranges": "bytes"})
 
 if __name__ == "__main__":
     import uvicorn
