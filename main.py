@@ -2,9 +2,11 @@ import os
 import re
 import io
 import csv
+import sys
 import time
 import hashlib
 import shutil
+import logging
 import requests
 import xlsx2csv
 import traceback
@@ -14,6 +16,16 @@ from fastapi import FastAPI, HTTPException, Header, Query, UploadFile, File, Bod
 from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+# --- Logging Setup (flushes immediately for Render) ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-5s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
+)
+log = logging.getLogger("bridge")
+log.setLevel(logging.INFO)
 
 app = FastAPI()
 
@@ -26,9 +38,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-print("\n" + "="*40)
-print("XLSX-to-CSV Bridge Starting...")
-print("="*40 + "\n")
+log.info("=" * 40)
+log.info("XLSX-to-CSV Bridge Starting...")
+log.info("=" * 40)
 
 @app.get("/")
 async def root():
@@ -350,9 +362,9 @@ def perform_conversion_from_url(file_id: str, sheet_name: str | None, cache_path
     try:
         # Check if source XLSX is already cached and fresh (e.g. < 10 mins)
         if tmp_xlsx.exists() and (time.time() - tmp_xlsx.stat().st_mtime < 600):
-            print(f"Using cached source XLSX for {file_id}")
+            log.info(f"[CACHE] Using cached source XLSX for {file_id}")
         else:
-            print(f"Downloading source XLSX for {file_id}")
+            log.info(f"[DOWNLOAD] Starting download for {file_id}...")
             # 1. Stream download directly to disk (Critical for 100MB+ files)
             response = session.get(download_url, headers=headers, stream=True)
             if response.status_code == 200 and "confirm=" in response.text:
@@ -388,7 +400,7 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
         parser_info = xlsx2csv.Xlsx2csv(str(xlsx_path))
         sheet_info = parser_info.workbook.sheets
         sheet_names = [s['name'] for s in sheet_info]
-        print(f"Workbook Details: Sheets={sheet_names}")
+        log.info(f"[CONVERT] Workbook opened. Sheets found: {sheet_names}")
         
         target_indices = [] # Holds indices (1-based for xlsx2csv)
         
@@ -412,7 +424,7 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
             
             for s_idx in target_indices:
                 s_name = next(s['name'] for s in sheet_info if s['index'] == s_idx)
-                print(f"Filtering sheet: {s_name} (Index: {s_idx})")
+                log.info(f"[FILTER] ▶ Processing sheet: '{s_name}' (Index: {s_idx})")
                 
                 # Custom output class to filter rows on the fly
                 class FilteredOutput:
@@ -453,7 +465,7 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
                     def process_row_data(self, row):
                         self.row_count += 1
                         if self.row_count % 10000 == 0:
-                            print(f"Still working on {s_name}... {self.row_count} rows processed (Matches: {self.match_count})")
+                            log.info(f"[FILTER] ⏳ {s_name}: {self.row_count:,} rows processed, {self.match_count:,} matches so far")
                             
                         if not row: return
                         
@@ -497,16 +509,16 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
                 try:
                     xlsx2csv.Xlsx2csv(str(xlsx_path), skip_empty_lines=True).convert(f_output, sheetid=s_idx)
                     f_output.finalize()
-                    print(f"Finished {s_name}: {f_output.row_count} rows, {f_output.match_count} matches.")
+                    log.info(f"[FILTER] ✅ Done '{s_name}': {f_output.row_count:,} rows scanned, {f_output.match_count:,} matches kept")
 
                 except Exception as e:
-                    print(f"Error processing sheet index {s_idx}: {str(e)}")
+                    log.error(f"[FILTER] ❌ Error on sheet index {s_idx}: {str(e)}")
                     traceback.print_exc()
                     raise e
 
-        print("Filtering & Conversion Complete.")
+        log.info("[CONVERT] ✅ Filtering & Conversion Complete.")
     except Exception as e:
-        print(f"CRITICAL CONVERSION ERROR: {str(e)}")
+        log.error(f"[CONVERT] ❌ CRITICAL ERROR: {str(e)}")
         traceback.print_exc()
         if isinstance(e, HTTPException): raise e
         raise HTTPException(status_code=500, detail=f"Xlsx2csv Error: {str(e)}")
@@ -526,14 +538,24 @@ async def test_upload(
     file_id = f"test_{int(time.time())}"
     tmp_xlsx = CACHE_DIR / f"{file_id}.xlsx"
     cache_path = CACHE_DIR / f"{file_id}.csv"
+    start_time = time.time()
+
+    log.info(f"[UPLOAD] 📥 Received file: '{file.filename}' (Sheet={sheet_name or 'ALL'}, Target={target_value})")
 
     try:
         with open(tmp_xlsx, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
         
+        file_size_mb = tmp_xlsx.stat().st_size / (1024 * 1024)
+        log.info(f"[UPLOAD] 💾 Saved to disk: {file_size_mb:.1f} MB")
+        
         convert_xlsx_to_csv(tmp_xlsx, sheet_name, cache_path, target_val=target_value, date_val=date_str)
         
         if tmp_xlsx.exists(): tmp_xlsx.unlink()
+        
+        elapsed = time.time() - start_time
+        csv_size_kb = cache_path.stat().st_size / 1024
+        log.info(f"[UPLOAD] ✅ Complete in {elapsed:.1f}s → CSV output: {csv_size_kb:.1f} KB")
         
         return FileResponse(
             path=cache_path,
@@ -554,7 +576,7 @@ async def handle_conversion_request(
 ):
     # 1. Security Check
     if REQUIRED_API_KEY and api_key_provided != REQUIRED_API_KEY:
-        print(f"Auth Failed: Provided={api_key_provided}")
+        log.warning(f"[AUTH] ⛔ Failed: key does not match")
         raise HTTPException(status_code=403, detail="Unauthorized")
 
     if not drive_url:
@@ -564,7 +586,7 @@ async def handle_conversion_request(
     
     # Clean sheet name for logging
     clean_sheet_log = sheet_name if sheet_name else "ALL_SHEETS_FILTERED"
-    print(f"Request: File={file_id}, Sheet={clean_sheet_log}, Target={target_value}")
+    log.info(f"[REQUEST] 📨 File={file_id}, Sheet={clean_sheet_log}, Target={target_value}")
 
     # Create a unique cache key based on params
     cache_key_raw = f"{file_id}_{sheet_name}_{target_value}_{date_str}"
@@ -573,11 +595,11 @@ async def handle_conversion_request(
 
     # 3. Check Cache
     if not cache_path.exists() or (time.time() - cache_path.stat().st_mtime > 600):
-        print(f"Starting Filter & Conversion for {file_id}")
+        log.info(f"[REQUEST] 🔄 Cache miss — starting filter & conversion for {file_id}")
         perform_conversion_from_url_with_filter(file_id, sheet_name, cache_path, target_value, date_str)
 
     total_size = cache_path.stat().st_size
-    print(f"Response Size: {total_size} bytes")
+    log.info(f"[REQUEST] ✅ Response ready: {total_size:,} bytes")
 
     # 4. Handle Range Request or Full Response
     if range_header:
@@ -646,7 +668,7 @@ def perform_conversion_from_url_with_filter(file_id: str, sheet_name: str | None
 
     try:
         if not tmp_xlsx.exists() or (time.time() - tmp_xlsx.stat().st_mtime > 600):
-            print(f"Downloading source XLSX for {file_id}")
+            log.info(f"[DOWNLOAD] Starting download for {file_id}...")
             response = session.get(download_url, headers=headers, stream=True)
             # Handle confirmation page
             if "confirm=" in response.text:
