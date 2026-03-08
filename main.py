@@ -547,7 +547,8 @@ def extract_ofd_ofp_total(xlsx_path: Path, target_val: str = "MRZ") -> int:
 
         log.info(f"[TOTAL] 🔍 Scanning '{D1_SUMMARY_SHEET}' for OFD+OFP total (MRZ row)...")
 
-        result = {"total": 0, "found": False, "ofd_col": None, "ofp_col": None, "dc_col": None}
+        # Use sentinel None vs index — fix: col index 0 is falsy, must use explicit None check
+        result = {"total": 0, "found": False, "ofd_col": None, "ofp_col": None, "dc_col": None, "header_done": False}
 
         class TotalExtractor:
             def __init__(self):
@@ -565,28 +566,33 @@ def extract_ofd_ofp_total(xlsx_path: Path, target_val: str = "MRZ") -> int:
                 combined = "".join(self._buf)
                 self._buf = []
                 for line in combined.split("\n"):
-                    if not line or self._done:
+                    if not line.strip() or self._done:
                         continue
                     try:
                         row = next(csv.reader(io.StringIO(line)))
                     except Exception:
                         continue
-                    if not row:
+                    # Skip completely empty rows
+                    if not row or not any(c.strip() for c in row):
                         continue
 
-                    # First row = headers
-                    if result["ofd_col"] is None and result["dc_col"] is None:
+                    # First non-empty row = headers
+                    if not result["header_done"]:
                         col_map = {str(h).strip().upper(): i for i, h in enumerate(row)}
-                        result["dc_col"]  = col_map.get("SOURCE_DC") or col_map.get("DC")
+                        # Use explicit None check — index 0 is valid but falsy
+                        result["dc_col"]  = col_map.get("SOURCE_DC") if "SOURCE_DC" in col_map else col_map.get("DC")
                         result["ofd_col"] = col_map.get("OFD")
                         result["ofp_col"] = col_map.get("OFP")
-                        log.info(f"[TOTAL] Headers found — DC col: {result['dc_col']}, OFD col: {result['ofd_col']}, OFP col: {result['ofp_col']}")
+                        result["header_done"] = True
+                        log.info(f"[TOTAL] Headers — DC col: {result['dc_col']}, OFD col: {result['ofd_col']}, OFP col: {result['ofp_col']}")
+                        log.info(f"[TOTAL] All header keys: {list(col_map.keys())}")
                         continue
 
                     # Data rows — find MRZ row
                     dc_col = result["dc_col"]
                     if dc_col is not None and len(row) > dc_col:
-                        if str(row[dc_col]).strip().upper() == target_val.upper():
+                        cell_val = str(row[dc_col]).strip().upper()
+                        if cell_val == target_val.upper():
                             ofd_val = 0
                             ofp_val = 0
                             try:
