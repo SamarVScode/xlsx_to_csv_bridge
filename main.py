@@ -313,7 +313,7 @@ API_KEY_NAME = "X-API-KEY"
 REQUIRED_API_KEY = os.getenv("API_KEY")
 CACHE_DIR = Path("/tmp/xlsx_cache")
 CACHE_DIR.mkdir(exist_ok=True)
-CACHE_TTL = 1800  # 30 minutes (was 600s / 10 min)
+CACHE_TTL = 1800  # 30 minutes
 
 # --- Async Job Store ---
 active_jobs = {}  # { job_id: { status, cache_path, error, progress } }
@@ -323,30 +323,23 @@ class ConversionRequest(BaseModel):
     sheet_name: str | None = None
 
 def verify_api_key(x_api_key: str = Header(..., alias="X-API-KEY")):
-    """Validates the X-API-KEY header."""
     if REQUIRED_API_KEY and x_api_key != REQUIRED_API_KEY:
         raise HTTPException(status_code=403, detail="Invalid API Key")
     return x_api_key
 
 def extract_file_id(url: str) -> str:
-    """Extracts the Google Drive file ID from various URL formats."""
-    # Standard /d/ID format
     match = re.search(r"/d/([a-zA-Z0-9_-]+)", url)
     if match:
         return match.group(1)
-    # uc?id=ID format
     match = re.search(r"id=([a-zA-Z0-9_-]+)", url)
     if match:
         return match.group(1)
-    # open?id=ID format
     match = re.search(r"open\?id=([a-zA-Z0-9_-]+)", url)
     if match:
         return match.group(1)
-    
     raise HTTPException(status_code=400, detail="Could not extract File ID from URL")
 
 def parse_range_header(range_header: str, content_length: int):
-    """Parses the Range header and returns start, end."""
     match = re.search(r"bytes=(\d+)-(\d*)", range_header)
     if match:
         start = int(match.group(1))
@@ -355,46 +348,136 @@ def parse_range_header(range_header: str, content_length: int):
         return start, end
     return 0, content_length - 1
 
-def perform_conversion_from_url(file_id: str, sheet_name: str | None, cache_path: Path):
-    """Downloads XLSX directly to disk and then converts to CSV on disk."""
+# =============================================================================
+# FIXED DOWNLOAD FUNCTION — handles large files & Google's virus-scan warning
+# =============================================================================
+
+def download_drive_file(file_id: str, dest_path: Path) -> None:
+    """
+    Downloads a Google Drive file to dest_path, correctly handling:
+      1. Google's virus-scan warning page for large files (>~100MB)
+         — detects the HTML warning and re-requests with the confirm token
+      2. Streams directly to disk — never loads full file into memory
+      3. Validates the downloaded file is a real binary (not an HTML error page)
+    """
     session = requests.Session()
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/120.0.0.0 Safari/537.36"
     }
-    
-    download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
-    tmp_xlsx = CACHE_DIR / f"{file_id}.xlsx"
 
-    try:
-        # Check if source XLSX is already cached and fresh (e.g. < 10 mins)
-        if tmp_xlsx.exists() and (time.time() - tmp_xlsx.stat().st_mtime < CACHE_TTL):
-            log.info(f"[CACHE] Using cached source XLSX for {file_id}")
-        else:
-            log.info(f"[DOWNLOAD] Starting download for {file_id}...")
-            # 1. Stream download directly to disk (Critical for 100MB+ files)
-            response = session.get(download_url, headers=headers, stream=True)
-            if response.status_code == 200 and "confirm=" in response.text:
-                confirm_match = re.search(r'confirm=([a-zA-Z0-9_-]+)', response.text)
-                if confirm_match:
-                    confirm_token = confirm_match.group(1)
-                    download_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm={confirm_token}"
-                    response = session.get(download_url, headers=headers, stream=True)
-            
+    base_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    log.info(f"[DOWNLOAD] Starting download for {file_id}...")
+
+    # ── Step 1: Initial request (no stream yet — we need to check for warning page) ──
+    # Use a small initial request to check if Google redirects us to a warning page.
+    # For large files, Google returns a small HTML page asking you to confirm.
+    # We use stream=True but only peek at the first chunk to detect HTML.
+    response = session.get(base_url, headers=headers, stream=True, allow_redirects=True)
+    response.raise_for_status()
+
+    content_type = response.headers.get("Content-Type", "")
+    log.info(f"[DOWNLOAD] Initial response Content-Type: {content_type}")
+
+    # ── Step 2: Detect Google's virus-scan warning page ──
+    # If Content-Type is HTML, this is the "file too large to scan" warning.
+    # We need to extract the confirm token and re-request.
+    if "text/html" in content_type:
+        log.info(f"[DOWNLOAD] ⚠️ Got HTML response — likely Google's large-file warning. Extracting confirm token...")
+
+        # Read the HTML (it's small — just a warning page)
+        html_content = b""
+        for chunk in response.iter_content(chunk_size=4096):
+            html_content += chunk
+            if len(html_content) > 1_000_000:  # Safety: don't read more than 1MB of HTML
+                break
+        html_text = html_content.decode("utf-8", errors="ignore")
+
+        # Try multiple token extraction patterns Google has used over the years
+        confirm_token = None
+
+        # Pattern 1: confirm=t (newer Google Drive)
+        m = re.search(r'confirm=([a-zA-Z0-9_\-]+)', html_text)
+        if m:
+            confirm_token = m.group(1)
+
+        # Pattern 2: Cookie-based token (Google sets download_warning_* cookie)
+        if not confirm_token:
+            for cookie_name, cookie_val in session.cookies.items():
+                if "download_warning" in cookie_name:
+                    confirm_token = cookie_val
+                    log.info(f"[DOWNLOAD] Got confirm token from cookie: {cookie_name}")
+                    break
+
+        # Pattern 3: UUID-style token in form action
+        if not confirm_token:
+            m = re.search(r'uuid=([a-zA-Z0-9_\-]+)', html_text)
+            if m:
+                confirm_token = m.group(1)
+
+        if confirm_token:
+            confirmed_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm={confirm_token}"
+            log.info(f"[DOWNLOAD] Re-requesting with confirm token: {confirm_token[:8]}...")
+            response = session.get(confirmed_url, headers=headers, stream=True, allow_redirects=True)
             response.raise_for_status()
-            with open(tmp_xlsx, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
+            content_type = response.headers.get("Content-Type", "")
+            log.info(f"[DOWNLOAD] Confirmed response Content-Type: {content_type}")
+        else:
+            # Try the newer Google Drive export URL format as fallback
+            log.warning(f"[DOWNLOAD] No confirm token found. Trying alternate export URL...")
+            alt_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t"
+            response = session.get(alt_url, headers=headers, stream=True, allow_redirects=True)
+            response.raise_for_status()
+            content_type = response.headers.get("Content-Type", "")
+            log.info(f"[DOWNLOAD] Alt URL Content-Type: {content_type}")
 
-        # 2. Convert from disk with filtering
-        convert_xlsx_to_csv(tmp_xlsx, sheet_name, cache_path)
-        
-        # Note: We don't cleanup tmp_xlsx here anymore, so it's available for other sheet requests.
-        # It will be overwritten/refreshed after 10 minutes.
+    # ── Step 3: Stream the actual file to disk ──
+    if "text/html" in content_type:
+        # Still getting HTML after confirm attempt — something is wrong
+        raise HTTPException(
+            status_code=500,
+            detail=f"Google Drive returned an HTML page instead of the file. "
+                   f"The file may not be publicly shared or the sharing link may be invalid."
+        )
 
-    except Exception as e:
-        if tmp_xlsx.exists(): tmp_xlsx.unlink()
-        if isinstance(e, HTTPException): raise e
-        raise HTTPException(status_code=500, detail=f"Conversion failed: {str(e)}")
+    log.info(f"[DOWNLOAD] Streaming file to disk: {dest_path}")
+    bytes_written = 0
+    with open(dest_path, 'wb') as f:
+        for chunk in response.iter_content(chunk_size=32768):  # 32KB chunks
+            if chunk:
+                f.write(chunk)
+                bytes_written += len(chunk)
+
+    size_mb = bytes_written / (1024 * 1024)
+    log.info(f"[DOWNLOAD] ✅ Download complete: {size_mb:.1f} MB written to {dest_path.name}")
+
+    # ── Step 4: Validate downloaded file is real binary (not HTML error) ──
+    if bytes_written < 100:
+        dest_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"Downloaded file is too small ({bytes_written} bytes) — likely an error page.")
+
+    # Check magic bytes: real XLSX starts with PK\x03\x04 (ZIP format)
+    with open(dest_path, 'rb') as f:
+        magic = f.read(4)
+
+    if magic != b'PK\x03\x04':
+        # Read first 500 bytes to help debug what we actually got
+        with open(dest_path, 'rb') as f:
+            preview = f.read(500).decode('utf-8', errors='ignore')
+        dest_path.unlink(missing_ok=True)
+        log.error(f"[DOWNLOAD] ❌ File is not a valid XLSX/ZIP. Magic bytes: {magic}. Preview: {preview[:200]}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Downloaded file is not a valid XLSX (got {magic} instead of ZIP magic bytes). "
+                   f"Google may have returned an error page. Ensure the file is publicly shared."
+        )
+
+    log.info(f"[DOWNLOAD] ✅ Magic byte check passed — valid XLSX/ZIP confirmed.")
+
+# =============================================================================
+# CONVERSION
+# =============================================================================
 
 def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: Path, target_val: str = "MRZ", date_val: str | None = None):
     """
@@ -402,13 +485,12 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
     Memory usage: < 50MB even for 100MB+ files.
     """
     try:
-        # 1. Get sheet info
         parser_info = xlsx2csv.Xlsx2csv(str(xlsx_path))
         sheet_info = parser_info.workbook.sheets
         sheet_names = [s['name'] for s in sheet_info]
         log.info(f"[CONVERT] Workbook opened. Sheets found: {sheet_names}")
         
-        target_indices = [] # Holds indices (1-based for xlsx2csv)
+        target_indices = []
         
         if sheet_name_req and sheet_name_req.strip():
             target = sheet_name_req.strip().lower()
@@ -421,7 +503,6 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
                 raise HTTPException(status_code=400, detail=f"Sheet '{sheet_name_req}' not found")
             target_indices.append(found_idx)
         else:
-            # Process all sheets
             for s in sheet_info:
                 target_indices.append(s['index'])
 
@@ -432,7 +513,6 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
                 s_name = next(s['name'] for s in sheet_info if s['index'] == s_idx)
                 log.info(f"[FILTER] ▶ Processing sheet: '{s_name}' (Index: {s_idx})")
                 
-                # Custom output class to filter rows on the fly
                 class FilteredOutput:
                     def __init__(self, csv_writer, date_val, target_val, sheet_name):
                         self.writer = csv_writer
@@ -446,25 +526,19 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
                         self.line_buffer = ""
 
                     def write(self, data):
-                        # xlsx2csv writes chunks of CSV-formatted text
-                        # Handle potential bytes from some xlsx2csv versions
                         if isinstance(data, bytes):
                             data = data.decode('utf-8', errors='ignore')
-                        
                         self.line_buffer += data
                         if "\n" in self.line_buffer:
-                            # Split by newline, filter out empty, but keep remainder
                             parts = self.line_buffer.split("\n")
                             for line in parts[:-1]:
                                 if line.strip():
                                     try:
-                                        # Parse CSV line safely
                                         f_line = io.StringIO(line)
                                         reader = csv.reader(f_line)
                                         row = next(reader)
                                         self.process_row_data(row)
-                                    except Exception as e:
-                                        # Silent fail for malformed lines
+                                    except Exception:
                                         pass
                             self.line_buffer = parts[-1]
 
@@ -472,30 +546,24 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
                         self.row_count += 1
                         if self.row_count % 10000 == 0:
                             log.info(f"[FILTER] ⏳ {s_name}: {self.row_count:,} rows processed, {self.match_count:,} matches so far")
-                            
                         if not row: return
                         
                         if self.first_row_in_sheet:
                             self.first_row_in_sheet = False
-                            # Detect headers
                             col_map = {str(h).strip(): i for i, h in enumerate(row) if h is not None}
                             self.target_col_idx = col_map.get("Source_DC")
                             if self.target_col_idx is None:
                                 self.target_col_idx = col_map.get("DC")
-                            
-                            # Write headers for EVERY sheet (different sheets have different columns)
                             header_list = ["Sheet"] + list(row)
                             if self.date_val: header_list.append("Date")
                             self.writer.writerow(header_list)
                             return
 
-                        # Filter check
                         if self.target_col_idx is not None and len(row) > self.target_col_idx:
                             raw_val = row[self.target_col_idx]
                             val = str(raw_val).strip() if raw_val is not None else ""
                             if val == self.target_val:
                                 self.match_count += 1
-                                # Prepend sheet name to the row
                                 row_list = [s_name] + list(row)
                                 if self.date_val: row_list.append(self.date_val)
                                 self.writer.writerow(row_list)
@@ -507,7 +575,7 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
                                 reader = csv.reader(f_line)
                                 row = next(reader)
                                 self.process_row_data(row)
-                            except:
+                            except Exception:
                                 pass
                         self.line_buffer = ""
 
@@ -516,7 +584,6 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
                     xlsx2csv.Xlsx2csv(str(xlsx_path), skip_empty_lines=True).convert(f_output, sheetid=s_idx)
                     f_output.finalize()
                     log.info(f"[FILTER] ✅ Done '{s_name}': {f_output.row_count:,} rows scanned, {f_output.match_count:,} matches kept")
-
                 except Exception as e:
                     log.error(f"[FILTER] ❌ Error on sheet index {s_idx}: {str(e)}")
                     traceback.print_exc()
@@ -529,6 +596,38 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
         if isinstance(e, HTTPException): raise e
         raise HTTPException(status_code=500, detail=f"Xlsx2csv Error: {str(e)}")
 
+# =============================================================================
+# CORE DOWNLOAD + CONVERT (used by all endpoints)
+# =============================================================================
+
+def perform_conversion_from_url_with_filter(file_id: str, sheet_name: str | None, cache_path: Path, target_val: str, date_val: str | None):
+    """Downloads XLSX via the fixed download_drive_file(), then converts to CSV."""
+    tmp_xlsx = CACHE_DIR / f"{file_id}.xlsx"
+
+    try:
+        # Use cached XLSX if fresh
+        if tmp_xlsx.exists() and (time.time() - tmp_xlsx.stat().st_mtime < CACHE_TTL):
+            log.info(f"[DOWNLOAD] Using cached XLSX for {file_id}")
+        else:
+            # Delete stale cache if present
+            if tmp_xlsx.exists():
+                tmp_xlsx.unlink()
+            # Download with full large-file + confirm-token handling
+            download_drive_file(file_id, tmp_xlsx)
+
+        convert_xlsx_to_csv(tmp_xlsx, sheet_name, cache_path, target_val, date_val)
+
+    except Exception as e:
+        if tmp_xlsx.exists():
+            tmp_xlsx.unlink(missing_ok=True)
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Keep old function name for /convert endpoint compatibility
+def perform_conversion_from_url(file_id: str, sheet_name: str | None, cache_path: Path):
+    perform_conversion_from_url_with_filter(file_id, sheet_name, cache_path, "MRZ", None)
+
 @app.post("/test-upload")
 async def test_upload(
     file: UploadFile = File(...),
@@ -537,7 +636,6 @@ async def test_upload(
     target_value: str = Query("MRZ"),
     x_api_key: Optional[str] = Header(None, alias="X-API-KEY")
 ):
-    """Endpoint for manual testing via local file upload."""
     if REQUIRED_API_KEY and x_api_key != REQUIRED_API_KEY:
         raise HTTPException(status_code=403, detail="Unauthorized")
 
@@ -563,11 +661,7 @@ async def test_upload(
         csv_size_kb = cache_path.stat().st_size / 1024
         log.info(f"[UPLOAD] ✅ Complete in {elapsed:.1f}s → CSV output: {csv_size_kb:.1f} KB")
         
-        return FileResponse(
-            path=cache_path,
-            media_type="text/csv",
-            filename="converted.csv"
-        )
+        return FileResponse(path=cache_path, media_type="text/csv", filename="converted.csv")
     except Exception as e:
         if tmp_xlsx.exists(): tmp_xlsx.unlink()
         raise HTTPException(status_code=500, detail=str(e))
@@ -580,7 +674,6 @@ async def handle_conversion_request(
     date_str: Optional[str] = None,
     target_value: str = "MRZ"
 ):
-    # 1. Security Check
     if REQUIRED_API_KEY and api_key_provided != REQUIRED_API_KEY:
         log.warning(f"[AUTH] ⛔ Failed: key does not match")
         raise HTTPException(status_code=403, detail="Unauthorized")
@@ -589,17 +682,13 @@ async def handle_conversion_request(
         raise HTTPException(status_code=400, detail="drive_url is required")
 
     file_id = extract_file_id(drive_url)
-    
-    # Clean sheet name for logging
     clean_sheet_log = sheet_name if sheet_name else "ALL_SHEETS_FILTERED"
     log.info(f"[REQUEST] 📨 File={file_id}, Sheet={clean_sheet_log}, Target={target_value}")
 
-    # Create a unique cache key based on params
     cache_key_raw = f"{file_id}_{sheet_name}_{target_value}_{date_str}"
     cache_key = hashlib.md5(cache_key_raw.encode()).hexdigest()
     cache_path = CACHE_DIR / f"{cache_key}.csv"
 
-    # 3. Check Cache
     if not cache_path.exists() or (time.time() - cache_path.stat().st_mtime > CACHE_TTL):
         log.info(f"[REQUEST] 🔄 Cache miss — starting filter & conversion for {file_id}")
         perform_conversion_from_url_with_filter(file_id, sheet_name, cache_path, target_value, date_str)
@@ -607,18 +696,15 @@ async def handle_conversion_request(
     total_size = cache_path.stat().st_size
     log.info(f"[REQUEST] ✅ Response ready: {total_size:,} bytes")
 
-    # 4. Handle Range Request or Full Response
     if range_header:
         start, end = parse_range_header(range_header, total_size)
         if end >= total_size: end = total_size - 1
         if start > end: raise HTTPException(status_code=416, detail="Range Not Satisfiable")
-
         chunk_size = end - start + 1
         def iterfile():
             with open(cache_path, "rb") as f:
                 f.seek(start)
                 yield f.read(chunk_size)
-
         return StreamingResponse(
             iterfile(),
             status_code=206,
@@ -665,34 +751,8 @@ async def convert_post(
     sn = sheet_name or (request_data.sheet_name if request_data else None)
     return await handle_conversion_request(url, sn, x_api_key or api_key, range_header, date_str, target_value)
 
-def perform_conversion_from_url_with_filter(file_id: str, sheet_name: str | None, cache_path: Path, target_val: str, date_val: str | None):
-    """Refactored version of perform_conversion_from_url to carry filter params."""
-    session = requests.Session()
-    headers = {"User-Agent": "Mozilla/5.0"}
-    download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
-    tmp_xlsx = CACHE_DIR / f"{file_id}.xlsx"
-
-    try:
-        if not tmp_xlsx.exists() or (time.time() - tmp_xlsx.stat().st_mtime > CACHE_TTL):
-            log.info(f"[DOWNLOAD] Starting download for {file_id}...")
-            response = session.get(download_url, headers=headers, stream=True)
-            # Handle confirmation page
-            if "confirm=" in response.text:
-                token = re.search(r'confirm=([a-zA-Z0-9_-]+)', response.text).group(1)
-                download_url += f"&confirm={token}"
-                response = session.get(download_url, headers=headers, stream=True)
-            response.raise_for_status()
-            with open(tmp_xlsx, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-
-        convert_xlsx_to_csv(tmp_xlsx, sheet_name, cache_path, target_val, date_val)
-    except Exception as e:
-        if tmp_xlsx.exists(): tmp_xlsx.unlink()
-        raise HTTPException(status_code=500, detail=str(e))
-
 # =============================================================================
-# ASYNC JOB SYSTEM (for GAS which has a 6-min UrlFetchApp timeout)
+# ASYNC JOB SYSTEM
 # =============================================================================
 
 @app.get("/convert-async")
@@ -704,7 +764,6 @@ async def convert_async(
     x_api_key: Optional[str] = Header(None, alias="X-API-KEY"),
     api_key: Optional[str] = Query(None),
 ):
-    """Starts conversion in background, returns job_id immediately."""
     key = x_api_key or api_key
     if REQUIRED_API_KEY and key != REQUIRED_API_KEY:
         raise HTTPException(status_code=403, detail="Unauthorized")
@@ -714,18 +773,15 @@ async def convert_async(
     file_id = extract_file_id(drive_url)
     job_id = str(uuid.uuid4())[:8]
 
-    # Build cache key
     cache_key_raw = f"{file_id}_{sheet_name}_{target_value}_{date_str}"
     cache_key = hashlib.md5(cache_key_raw.encode()).hexdigest()
     cache_path = CACHE_DIR / f"{cache_key}.csv"
 
-    # If result is already cached, return immediately
     if cache_path.exists() and (time.time() - cache_path.stat().st_mtime < CACHE_TTL):
         log.info(f"[ASYNC] Job {job_id}: cache hit, returning done immediately")
         active_jobs[job_id] = {"status": "done", "cache_path": str(cache_path), "error": None, "progress": "Cached"}
         return {"job_id": job_id, "status": "done"}
 
-    # Start background thread
     active_jobs[job_id] = {"status": "processing", "cache_path": str(cache_path), "error": None, "progress": "Starting..."}
     log.info(f"[ASYNC] Job {job_id}: starting background conversion for {file_id}")
 
@@ -739,7 +795,6 @@ async def convert_async(
     return {"job_id": job_id, "status": "processing"}
 
 def background_conversion(job_id, file_id, sheet_name, cache_path, target_val, date_val):
-    """Runs in a background thread. Updates active_jobs on completion."""
     try:
         active_jobs[job_id]["progress"] = "Downloading XLSX..."
         perform_conversion_from_url_with_filter(file_id, sheet_name, cache_path, target_val, date_val)
@@ -751,10 +806,10 @@ def background_conversion(job_id, file_id, sheet_name, cache_path, target_val, d
         active_jobs[job_id]["error"] = str(e)
         active_jobs[job_id]["progress"] = f"Failed: {str(e)}"
         log.error(f"[ASYNC] Job {job_id}: ❌ failed — {str(e)}")
+        traceback.print_exc()
 
 @app.get("/job/{job_id}")
 async def job_status(job_id: str):
-    """Check the status of an async conversion job."""
     job = active_jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found (server may have restarted)")
@@ -762,7 +817,6 @@ async def job_status(job_id: str):
 
 @app.get("/job/{job_id}/result")
 async def job_result(job_id: str):
-    """Download the CSV result of a completed async job."""
     job = active_jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
