@@ -479,32 +479,63 @@ def download_drive_file(file_id: str, dest_path: Path) -> None:
 # CONVERSION
 # =============================================================================
 
-def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: Path, target_val: str = "MRZ", date_val: str | None = None):
+# Sameday-specific sheets — only these two are processed when filename contains "sameday"
+SAMEDAY_SHEETS = ["Agent_view", "E2E_DC"]
+
+def is_sameday_file(filename: str) -> bool:
+    """Returns True if the filename contains 'sameday' (case-insensitive)."""
+    return "sameday" in (filename or "").lower()
+
+def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: Path, target_val: str = "MRZ", date_val: str | None = None, source_filename: str | None = None):
     """
     ULTRA-PERFORMANCE VERSION using xlsx2csv (SAX Parser).
     Memory usage: < 50MB even for 100MB+ files.
+
+    Sheet selection priority:
+      1. sheet_name_req explicitly passed   → only that sheet
+      2. source_filename contains "sameday" → only Agent_view + E2E_DC
+      3. Otherwise                          → ALL sheets
     """
     try:
         parser_info = xlsx2csv.Xlsx2csv(str(xlsx_path))
         sheet_info = parser_info.workbook.sheets
-        sheet_names = [s['name'] for s in sheet_info]
+        sheet_names = [s["name"] for s in sheet_info]
         log.info(f"[CONVERT] Workbook opened. Sheets found: {sheet_names}")
-        
+
         target_indices = []
-        
+
         if sheet_name_req and sheet_name_req.strip():
+            # Explicit single sheet requested
             target = sheet_name_req.strip().lower()
             found_idx = None
             for s in sheet_info:
-                if s['name'].strip().lower() == target:
-                    found_idx = s['index']
+                if s["name"].strip().lower() == target:
+                    found_idx = s["index"]
                     break
             if found_idx is None:
                 raise HTTPException(status_code=400, detail=f"Sheet '{sheet_name_req}' not found")
             target_indices.append(found_idx)
-        else:
+            log.info(f"[CONVERT] Mode: SINGLE sheet '{sheet_name_req}'")
+
+        elif is_sameday_file(source_filename):
+            # Sameday file — only scan Agent_view and E2E_DC
+            sameday_lower = [s.lower() for s in SAMEDAY_SHEETS]
             for s in sheet_info:
-                target_indices.append(s['index'])
+                if s["name"].strip().lower() in sameday_lower:
+                    target_indices.append(s["index"])
+            found_names  = [s["name"] for s in sheet_info if s["name"].strip().lower() in sameday_lower]
+            skipped_names = [s["name"] for s in sheet_info if s["name"].strip().lower() not in sameday_lower]
+            log.info(f"[CONVERT] Mode: SAMEDAY — processing {found_names}, skipping {skipped_names}")
+            if not target_indices:
+                log.warning("[CONVERT] ⚠️ No matching sameday sheets found. Falling back to ALL sheets.")
+                for s in sheet_info:
+                    target_indices.append(s["index"])
+
+        else:
+            # Default — all sheets
+            for s in sheet_info:
+                target_indices.append(s["index"])
+            log.info(f"[CONVERT] Mode: ALL sheets ({len(target_indices)} total)")
 
         # Use a large write buffer on the file — reduces OS-level write syscalls significantly
         with open(csv_path, "w", encoding="utf-8", newline="", buffering=256*1024) as f_out:
@@ -638,7 +669,7 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
 # CORE DOWNLOAD + CONVERT (used by all endpoints)
 # =============================================================================
 
-def perform_conversion_from_url_with_filter(file_id: str, sheet_name: str | None, cache_path: Path, target_val: str, date_val: str | None):
+def perform_conversion_from_url_with_filter(file_id: str, sheet_name: str | None, cache_path: Path, target_val: str, date_val: str | None, source_filename: str | None = None):
     """Downloads XLSX via the fixed download_drive_file(), then converts to CSV."""
     tmp_xlsx = CACHE_DIR / f"{file_id}.xlsx"
 
@@ -653,7 +684,7 @@ def perform_conversion_from_url_with_filter(file_id: str, sheet_name: str | None
             # Download with full large-file + confirm-token handling
             download_drive_file(file_id, tmp_xlsx)
 
-        convert_xlsx_to_csv(tmp_xlsx, sheet_name, cache_path, target_val, date_val)
+        convert_xlsx_to_csv(tmp_xlsx, sheet_name, cache_path, target_val, date_val, source_filename=source_filename)
 
     except Exception as e:
         if tmp_xlsx.exists():
@@ -682,7 +713,8 @@ async def test_upload(
     cache_path = CACHE_DIR / f"{file_id}.csv"
     start_time = time.time()
 
-    log.info(f"[UPLOAD] 📥 Received file: '{file.filename}' (Sheet={sheet_name or 'ALL'}, Target={target_value})")
+    sameday_mode = is_sameday_file(file.filename)
+    log.info(f"[UPLOAD] 📥 Received file: '{file.filename}' (Sheet={sheet_name or ('SAMEDAY:Agent_view+E2E_DC' if sameday_mode else 'ALL')}, Target={target_value})")
 
     try:
         with open(tmp_xlsx, "wb") as buffer:
@@ -691,7 +723,7 @@ async def test_upload(
         file_size_mb = tmp_xlsx.stat().st_size / (1024 * 1024)
         log.info(f"[UPLOAD] 💾 Saved to disk: {file_size_mb:.1f} MB")
         
-        convert_xlsx_to_csv(tmp_xlsx, sheet_name, cache_path, target_val=target_value, date_val=date_str)
+        convert_xlsx_to_csv(tmp_xlsx, sheet_name, cache_path, target_val=target_value, date_val=date_str, source_filename=file.filename)
         
         if tmp_xlsx.exists(): tmp_xlsx.unlink()
         
@@ -720,7 +752,11 @@ async def handle_conversion_request(
         raise HTTPException(status_code=400, detail="drive_url is required")
 
     file_id = extract_file_id(drive_url)
-    clean_sheet_log = sheet_name if sheet_name else "ALL_SHEETS_FILTERED"
+    # Try to extract filename from URL for sameday detection
+    fname_match = re.search(r"([^/=&]+\.xlsx)", drive_url, re.IGNORECASE)
+    source_filename = fname_match.group(1) if fname_match else None
+    sameday_mode = is_sameday_file(source_filename or "")
+    clean_sheet_log = sheet_name if sheet_name else ("SAMEDAY:Agent_view+E2E_DC" if sameday_mode else "ALL_SHEETS")
     log.info(f"[REQUEST] 📨 File={file_id}, Sheet={clean_sheet_log}, Target={target_value}")
 
     cache_key_raw = f"{file_id}_{sheet_name}_{target_value}_{date_str}"
@@ -729,7 +765,7 @@ async def handle_conversion_request(
 
     if not cache_path.exists() or (time.time() - cache_path.stat().st_mtime > CACHE_TTL):
         log.info(f"[REQUEST] 🔄 Cache miss — starting filter & conversion for {file_id}")
-        perform_conversion_from_url_with_filter(file_id, sheet_name, cache_path, target_value, date_str)
+        perform_conversion_from_url_with_filter(file_id, sheet_name, cache_path, target_value, date_str, source_filename=source_filename)
 
     total_size = cache_path.stat().st_size
     log.info(f"[REQUEST] ✅ Response ready: {total_size:,} bytes")
@@ -796,7 +832,8 @@ async def convert_post(
 @app.get("/convert-async")
 async def convert_async(
     drive_url: Optional[str] = Query(None),
-    sheet_name: Optional[str] = Query(None),
+    sheet_name: Optional[str] = Query(None),   # single sheet (legacy)
+    sheet_names: Optional[str] = Query(None),  # comma-separated list e.g. "E2E_DC,Agent_view"
     date_str: Optional[str] = Query(None),
     target_value: str = Query("MRZ"),
     x_api_key: Optional[str] = Header(None, alias="X-API-KEY"),
@@ -820,22 +857,26 @@ async def convert_async(
         active_jobs[job_id] = {"status": "done", "cache_path": str(cache_path), "error": None, "progress": "Cached"}
         return {"job_id": job_id, "status": "done"}
 
+    # Extract filename from URL for sameday sheet detection
+    fname_match = re.search(r"([^/=&]+\.xlsx)", drive_url, re.IGNORECASE)
+    source_filename = fname_match.group(1) if fname_match else None
+
     active_jobs[job_id] = {"status": "processing", "cache_path": str(cache_path), "error": None, "progress": "Starting..."}
     log.info(f"[ASYNC] Job {job_id}: starting background conversion for {file_id}")
 
     thread = threading.Thread(
         target=background_conversion,
-        args=(job_id, file_id, sheet_name, cache_path, target_value, date_str),
+        args=(job_id, file_id, sheet_name, cache_path, target_value, date_str, source_filename),
         daemon=True
     )
     thread.start()
 
     return {"job_id": job_id, "status": "processing"}
 
-def background_conversion(job_id, file_id, sheet_name, cache_path, target_val, date_val):
+def background_conversion(job_id, file_id, sheet_name, cache_path, target_val, date_val, source_filename=None):
     try:
         active_jobs[job_id]["progress"] = "Downloading XLSX..."
-        perform_conversion_from_url_with_filter(file_id, sheet_name, cache_path, target_val, date_val)
+        perform_conversion_from_url_with_filter(file_id, sheet_name, cache_path, target_val, date_val, source_filename=source_filename)
         active_jobs[job_id]["status"] = "done"
         active_jobs[job_id]["progress"] = "Complete"
         log.info(f"[ASYNC] Job {job_id}: ✅ completed successfully")
