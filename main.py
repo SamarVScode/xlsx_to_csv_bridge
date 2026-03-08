@@ -605,22 +605,25 @@ def extract_ofd_ofp_total(xlsx_path: Path, target_val: str = "MRZ") -> int:
                                     ofp_val = int(float(str(row[result["ofp_col"]]).strip() or "0"))
                             except (ValueError, TypeError):
                                 pass
+                            result["ofd_val"] = ofd_val
+                            result["ofp_val"] = ofp_val
                             result["total"] = ofd_val + ofp_val
                             result["found"] = True
                             self._done = True
-                            log.info(f"[TOTAL] ✅ MRZ row found — OFD={ofd_val}, OFP={ofp_val}, Total={result['total']}")
+                            log.info(f"[TOTAL] ✅ MRZ row found — OFD={ofd_val}, OFP={ofp_val}, Total (OFD+OFP)={result['total']}")
 
         extractor = TotalExtractor()
         xlsx2csv.Xlsx2csv(str(xlsx_path), skip_empty_lines=True).convert(extractor, sheetid=dexter_idx)
 
         if not result["found"]:
             log.warning(f"[TOTAL] ⚠️ MRZ row not found in '{D1_SUMMARY_SHEET}' — early-exit disabled")
-            return 0
+            return 0, 0, 0
 
-        return result["total"]
+        return result["ofd_val"], result["ofp_val"], result["total"]
 
     except Exception as e:
         log.error(f"[TOTAL] ❌ Failed to extract OFD+OFP total: {e}")
+        return 0, 0, 0
         traceback.print_exc()
         return 0
 
@@ -697,13 +700,14 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
             log.info(f"[CONVERT] D-1 — all 4 sheet types written to CSV: E2E_Dexter + E2E_DC + raw + Agent_view")
 
             # ── Extract OFD+OFP total from E2E_Dexter before main loop ──
-            early_exit_total = extract_ofd_ofp_total(xlsx_path, target_val)
+            ofd_total, ofp_total, early_exit_total = extract_ofd_ofp_total(xlsx_path, target_val)
+            log.info(f"[CONVERT] 📊 E2E_Dexter MRZ totals — OFD: {ofd_total} | OFP: {ofp_total} | OFD+OFP: {early_exit_total}")
             if early_exit_total > 0:
-                log.info(f"[CONVERT] ⚡ Early-exit enabled — will stop raw sheets once {early_exit_total} MRZ matches found")
+                log.info(f"[CONVERT] ⚡ Early-exit enabled — raw sheets stop once {early_exit_total} MRZ matches found")
                 if job_id:
                     job_totals[job_id] = early_exit_total
             else:
-                log.warning("[CONVERT] ⚠️ Early-exit disabled (total=0) — will scan all raw sheets fully")
+                log.warning("[CONVERT] ⚠️ Early-exit disabled (OFD+OFP=0) — will scan all raw sheets fully")
 
         else:
             # Default — all sheets
