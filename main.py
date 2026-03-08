@@ -679,16 +679,16 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
             dc_lower     = D1_DC_SHEET.lower()
             dexter_lower = D1_SUMMARY_SHEET.lower()
 
-            # Build ordered list: E2E_DC first, then raw sheets, then Agent_view
-            # (E2E_Dexter is read separately for total extraction — not written to CSV)
-            dc_indices    = [s["index"] for s in sheet_info if s["name"].strip().lower() == dc_lower]
-            raw_indices   = [s["index"] for s in sheet_info if s["name"].strip().lower() in raw_lower]
-            agent_indices = [s["index"] for s in sheet_info if s["name"].strip().lower() == agent_lower]
-            skipped       = [s["name"] for s in sheet_info if s["name"].strip().lower() == dexter_lower]
+            # Build ordered list: E2E_Dexter → E2E_DC → raw sheets → Agent_view
+            # E2E_Dexter is BOTH extracted for OFD+OFP total AND written to CSV
+            dexter_indices = [s["index"] for s in sheet_info if s["name"].strip().lower() == dexter_lower]
+            dc_indices     = [s["index"] for s in sheet_info if s["name"].strip().lower() == dc_lower]
+            raw_indices    = [s["index"] for s in sheet_info if s["name"].strip().lower() in raw_lower]
+            agent_indices  = [s["index"] for s in sheet_info if s["name"].strip().lower() == agent_lower]
 
-            target_indices = dc_indices + raw_indices + agent_indices
+            target_indices = dexter_indices + dc_indices + raw_indices + agent_indices
             log.info(f"[CONVERT] Mode: D-1 — order: {[s['name'] for s in sheet_info if s['index'] in target_indices]}")
-            log.info(f"[CONVERT] D-1 — skipping from CSV output (summary only): {skipped}")
+            log.info(f"[CONVERT] D-1 — all 4 sheet types written to CSV: E2E_Dexter + E2E_DC + raw + Agent_view")
 
             # ── Extract OFD+OFP total from E2E_Dexter before main loop ──
             early_exit_total = extract_ofd_ofp_total(xlsx_path, target_val)
