@@ -34,10 +34,10 @@ app = FastAPI()
 # --- CORS Configuration ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["https://script.google.com"],  # Only Google Apps Script needs CORS
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["X-API-KEY", "Content-Type"],
 )
 
 log.info("=" * 40)
@@ -47,6 +47,25 @@ log.info("=" * 40)
 @app.get("/")
 async def root():
     return {"status": "ready", "message": "XLSX-to-CSV Bridge is running. Visit /test for the UI."}
+
+@app.get("/health")
+async def health():
+    """Health check endpoint for Render and uptime monitors."""
+    _evict_old_jobs()
+    return {"status": "ok", "cache_dir": str(CACHE_DIR), "active_jobs": len(active_jobs)}
+
+def _evict_old_jobs(max_age_seconds: int = 7200):
+    """Evict jobs older than max_age_seconds from active_jobs to prevent memory leak."""
+    now = time.time()
+    to_delete = []
+    for jid, job in list(active_jobs.items()):
+        created = job.get("created_at", now)
+        if now - created > max_age_seconds:
+            to_delete.append(jid)
+    for jid in to_delete:
+        del active_jobs[jid]
+    if to_delete:
+        log.info(f"[CLEANUP] Evicted {len(to_delete)} old job(s) from active_jobs")
 
 @app.get("/test", response_class=HTMLResponse)
 async def test_page():
@@ -177,7 +196,7 @@ async def test_page():
 
         <div class="field">
             <label for="apiKey">X-API-KEY</label>
-            <input type="text" id="apiKey" value="a9F3kL8xQ2mZ7pR4tV6yH1nW5cX8bD0sE3uJ9gK2qL6zT4vY7">
+            <input type="text" id="apiKey" placeholder="Enter your X-API-KEY here">
         </div>
 
         <div class="field">
@@ -316,7 +335,14 @@ CACHE_DIR.mkdir(exist_ok=True)
 CACHE_TTL = 1800  # 30 minutes
 
 # --- Async Job Store ---
-active_jobs = {}  # { job_id: { status, cache_path, error, progress } }
+active_jobs = {}   # { job_id: { status, cache_path, error, progress, created_at } }
+job_totals  = {}   # { job_id: int } — OFD+OFP sum from E2E_Dexter MRZ row, used for early-exit on raw sheets
+
+# --- Concurrency Control ---
+# Render free tier: 512MB RAM. A single 250MB XLSX needs ~80MB RAM during conversion.
+# Two simultaneous conversions = ~160MB + overhead — technically safe, but we limit
+# to 1 at a time to avoid any risk of OOM kill. Queue a second job behind the first.
+conversion_semaphore = threading.Semaphore(1)
 
 class ConversionRequest(BaseModel):
     drive_url: str
@@ -374,7 +400,7 @@ def download_drive_file(file_id: str, dest_path: Path) -> None:
     # Use a small initial request to check if Google redirects us to a warning page.
     # For large files, Google returns a small HTML page asking you to confirm.
     # We use stream=True but only peek at the first chunk to detect HTML.
-    response = session.get(base_url, headers=headers, stream=True, allow_redirects=True)
+    response = session.get(base_url, headers=headers, stream=True, allow_redirects=True, timeout=(30, 300))
     response.raise_for_status()
 
     content_type = response.headers.get("Content-Type", "")
@@ -419,7 +445,7 @@ def download_drive_file(file_id: str, dest_path: Path) -> None:
         if confirm_token:
             confirmed_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm={confirm_token}"
             log.info(f"[DOWNLOAD] Re-requesting with confirm token: {confirm_token[:8]}...")
-            response = session.get(confirmed_url, headers=headers, stream=True, allow_redirects=True)
+            response = session.get(confirmed_url, headers=headers, stream=True, allow_redirects=True, timeout=(30, 300))
             response.raise_for_status()
             content_type = response.headers.get("Content-Type", "")
             log.info(f"[DOWNLOAD] Confirmed response Content-Type: {content_type}")
@@ -427,7 +453,7 @@ def download_drive_file(file_id: str, dest_path: Path) -> None:
             # Try the newer Google Drive export URL format as fallback
             log.warning(f"[DOWNLOAD] No confirm token found. Trying alternate export URL...")
             alt_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t"
-            response = session.get(alt_url, headers=headers, stream=True, allow_redirects=True)
+            response = session.get(alt_url, headers=headers, stream=True, allow_redirects=True, timeout=(30, 300))
             response.raise_for_status()
             content_type = response.headers.get("Content-Type", "")
             log.info(f"[DOWNLOAD] Alt URL Content-Type: {content_type}")
@@ -482,11 +508,117 @@ def download_drive_file(file_id: str, dest_path: Path) -> None:
 # Sameday-specific sheets — only these two are processed when filename contains "sameday"
 SAMEDAY_SHEETS = ["Agent_view", "E2E_DC"]
 
+# D-1 sheet roles
+D1_SUMMARY_SHEET  = "E2E_Dexter"   # Sheet 1 — read OFD+OFP total for MRZ row
+D1_DC_SHEET       = "E2E_DC"       # Sheet 2 — filter MRZ rows normally
+D1_RAW_SHEETS     = ["E2E_Raw", "North", "East", "West", "South"]   # Sheet 3+ raw data (variable)
+D1_AGENT_SHEET    = "Agent_view"   # Last sheet — always process fully
+
 def is_sameday_file(filename: str) -> bool:
     """Returns True if the filename contains 'sameday' (case-insensitive)."""
     return "sameday" in (filename or "").lower()
 
-def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: Path, target_val: str = "MRZ", date_val: str | None = None, source_filename: str | None = None):
+def is_d1_file(filename: str) -> bool:
+    """Returns True if the filename contains 'd-1' or 'd1' (case-insensitive)."""
+    fn = (filename or "").lower()
+    return "d-1" in fn or "_d1" in fn or "-d1" in fn
+
+def extract_ofd_ofp_total(xlsx_path: Path, target_val: str = "MRZ") -> int:
+    """
+    Scans E2E_Dexter sheet (Sheet 1 of D-1 file).
+    Finds the MRZ row, reads OFD and OFP column values, returns their sum.
+    This total is used as the early-exit threshold for raw data sheets.
+    Returns 0 if not found (disables early-exit — safe fallback).
+    """
+    try:
+        parser = xlsx2csv.Xlsx2csv(str(xlsx_path))
+        sheet_info = parser.workbook.sheets
+
+        # Find E2E_Dexter sheet index
+        dexter_idx = None
+        for s in sheet_info:
+            if s["name"].strip().lower() == D1_SUMMARY_SHEET.lower():
+                dexter_idx = s["index"]
+                break
+
+        if dexter_idx is None:
+            log.warning(f"[TOTAL] ⚠️ Sheet '{D1_SUMMARY_SHEET}' not found — early-exit disabled")
+            return 0
+
+        log.info(f"[TOTAL] 🔍 Scanning '{D1_SUMMARY_SHEET}' for OFD+OFP total (MRZ row)...")
+
+        result = {"total": 0, "found": False, "ofd_col": None, "ofp_col": None, "dc_col": None}
+
+        class TotalExtractor:
+            def __init__(self):
+                self._buf  = []
+                self._done = False
+
+            def write(self, data):
+                if self._done:
+                    return
+                if isinstance(data, bytes):
+                    data = data.decode("utf-8", errors="ignore")
+                self._buf.append(data)
+                if "\n" not in data:
+                    return
+                combined = "".join(self._buf)
+                self._buf = []
+                for line in combined.split("\n"):
+                    if not line or self._done:
+                        continue
+                    try:
+                        row = next(csv.reader(io.StringIO(line)))
+                    except Exception:
+                        continue
+                    if not row:
+                        continue
+
+                    # First row = headers
+                    if result["ofd_col"] is None and result["dc_col"] is None:
+                        col_map = {str(h).strip().upper(): i for i, h in enumerate(row)}
+                        result["dc_col"]  = col_map.get("SOURCE_DC") or col_map.get("DC")
+                        result["ofd_col"] = col_map.get("OFD")
+                        result["ofp_col"] = col_map.get("OFP")
+                        log.info(f"[TOTAL] Headers found — DC col: {result['dc_col']}, OFD col: {result['ofd_col']}, OFP col: {result['ofp_col']}")
+                        continue
+
+                    # Data rows — find MRZ row
+                    dc_col = result["dc_col"]
+                    if dc_col is not None and len(row) > dc_col:
+                        if str(row[dc_col]).strip().upper() == target_val.upper():
+                            ofd_val = 0
+                            ofp_val = 0
+                            try:
+                                if result["ofd_col"] is not None and len(row) > result["ofd_col"]:
+                                    ofd_val = int(float(str(row[result["ofd_col"]]).strip() or "0"))
+                            except (ValueError, TypeError):
+                                pass
+                            try:
+                                if result["ofp_col"] is not None and len(row) > result["ofp_col"]:
+                                    ofp_val = int(float(str(row[result["ofp_col"]]).strip() or "0"))
+                            except (ValueError, TypeError):
+                                pass
+                            result["total"] = ofd_val + ofp_val
+                            result["found"] = True
+                            self._done = True
+                            log.info(f"[TOTAL] ✅ MRZ row found — OFD={ofd_val}, OFP={ofp_val}, Total={result['total']}")
+
+        extractor = TotalExtractor()
+        xlsx2csv.Xlsx2csv(str(xlsx_path), skip_empty_lines=True).convert(extractor, sheetid=dexter_idx)
+
+        if not result["found"]:
+            log.warning(f"[TOTAL] ⚠️ MRZ row not found in '{D1_SUMMARY_SHEET}' — early-exit disabled")
+            return 0
+
+        return result["total"]
+
+    except Exception as e:
+        log.error(f"[TOTAL] ❌ Failed to extract OFD+OFP total: {e}")
+        traceback.print_exc()
+        return 0
+
+def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: Path, target_val: str = "MRZ", date_val: str | None = None, source_filename: str | None = None, job_id: str | None = None):
     """
     ULTRA-PERFORMANCE VERSION using xlsx2csv (SAX Parser).
     Memory usage: < 50MB even for 100MB+ files.
@@ -494,7 +626,13 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
     Sheet selection priority:
       1. sheet_name_req explicitly passed   → only that sheet
       2. source_filename contains "sameday" → only Agent_view + E2E_DC
-      3. Otherwise                          → ALL sheets
+      3. source_filename contains "d-1"     → D1 mode with early-exit optimization
+      4. Otherwise                          → ALL sheets
+
+    D-1 Early-Exit Optimization:
+      - E2E_Dexter (Sheet 1): extract OFD+OFP total for MRZ row → store in job_totals
+      - Raw sheets (Sheet 3+): once match_count == total → skip remaining raw sheets
+      - Agent_view: always processed fully
     """
     try:
         parser_info = xlsx2csv.Xlsx2csv(str(xlsx_path))
@@ -503,6 +641,8 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
         log.info(f"[CONVERT] Workbook opened. Sheets found: {sheet_names}")
 
         target_indices = []
+        d1_mode        = False
+        early_exit_total = 0  # 0 = disabled
 
         if sheet_name_req and sheet_name_req.strip():
             # Explicit single sheet requested
@@ -523,13 +663,41 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
             for s in sheet_info:
                 if s["name"].strip().lower() in sameday_lower:
                     target_indices.append(s["index"])
-            found_names  = [s["name"] for s in sheet_info if s["name"].strip().lower() in sameday_lower]
+            found_names   = [s["name"] for s in sheet_info if s["name"].strip().lower() in sameday_lower]
             skipped_names = [s["name"] for s in sheet_info if s["name"].strip().lower() not in sameday_lower]
             log.info(f"[CONVERT] Mode: SAMEDAY — processing {found_names}, skipping {skipped_names}")
             if not target_indices:
                 log.warning("[CONVERT] ⚠️ No matching sameday sheets found. Falling back to ALL sheets.")
                 for s in sheet_info:
                     target_indices.append(s["index"])
+
+        elif is_d1_file(source_filename):
+            # D-1 mode — smart sheet ordering with early-exit on raw sheets
+            d1_mode = True
+            raw_lower    = [r.lower() for r in D1_RAW_SHEETS]
+            agent_lower  = D1_AGENT_SHEET.lower()
+            dc_lower     = D1_DC_SHEET.lower()
+            dexter_lower = D1_SUMMARY_SHEET.lower()
+
+            # Build ordered list: E2E_DC first, then raw sheets, then Agent_view
+            # (E2E_Dexter is read separately for total extraction — not written to CSV)
+            dc_indices    = [s["index"] for s in sheet_info if s["name"].strip().lower() == dc_lower]
+            raw_indices   = [s["index"] for s in sheet_info if s["name"].strip().lower() in raw_lower]
+            agent_indices = [s["index"] for s in sheet_info if s["name"].strip().lower() == agent_lower]
+            skipped       = [s["name"] for s in sheet_info if s["name"].strip().lower() == dexter_lower]
+
+            target_indices = dc_indices + raw_indices + agent_indices
+            log.info(f"[CONVERT] Mode: D-1 — order: {[s['name'] for s in sheet_info if s['index'] in target_indices]}")
+            log.info(f"[CONVERT] D-1 — skipping from CSV output (summary only): {skipped}")
+
+            # ── Extract OFD+OFP total from E2E_Dexter before main loop ──
+            early_exit_total = extract_ofd_ofp_total(xlsx_path, target_val)
+            if early_exit_total > 0:
+                log.info(f"[CONVERT] ⚡ Early-exit enabled — will stop raw sheets once {early_exit_total} MRZ matches found")
+                if job_id:
+                    job_totals[job_id] = early_exit_total
+            else:
+                log.warning("[CONVERT] ⚠️ Early-exit disabled (total=0) — will scan all raw sheets fully")
 
         else:
             # Default — all sheets
@@ -540,13 +708,24 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
         # Use a large write buffer on the file — reduces OS-level write syscalls significantly
         with open(csv_path, "w", encoding="utf-8", newline="", buffering=256*1024) as f_out:
             writer = csv.writer(f_out)
-            
+
+            # Running match count across all raw sheets (for D-1 early-exit)
+            raw_matches_total = 0
+
             for s_idx in target_indices:
                 s_name = next(s['name'] for s in sheet_info if s['index'] == s_idx)
+
+                # D-1 early-exit check: if raw matches already hit total, skip remaining raw sheets
+                is_raw_sheet = d1_mode and s_name.strip().lower() in [r.lower() for r in D1_RAW_SHEETS]
+                if is_raw_sheet and early_exit_total > 0 and raw_matches_total >= early_exit_total:
+                    log.info(f"[FILTER] ⚡ Early-exit triggered — skipping '{s_name}' "
+                             f"(already found {raw_matches_total}/{early_exit_total} matches)")
+                    continue
+
                 log.info(f"[FILTER] ▶ Processing sheet: '{s_name}' (Index: {s_idx})")
                 
                 class FilteredOutput:
-                    def __init__(self, csv_writer, date_val, target_val, sheet_name):
+                    def __init__(self, csv_writer, date_val, target_val, sheet_name, early_exit=0):
                         self.writer       = csv_writer
                         self.date_val     = date_val
                         self.target_val   = target_val
@@ -555,6 +734,10 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
                         self.target_col   = None
                         self.row_count    = 0
                         self.match_count  = 0
+                        # early_exit > 0 means: stop writing once match_count == early_exit
+                        # This allows within-sheet early exit on the last raw sheet
+                        self.early_exit   = early_exit
+                        self._done        = False
                         # ── KEY FIX: use a list instead of str += str ──
                         # str concatenation creates a new object every call (O(n²)).
                         # list.append + "".join is O(n) and allocates far less.
@@ -562,6 +745,8 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
                         self._buf_len     = 0
 
                     def write(self, data):
+                        if self._done:
+                            return
                         if isinstance(data, bytes):
                             data = data.decode('utf-8', errors='ignore')
 
@@ -629,6 +814,12 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
                                 if self.date_val:
                                     row_list.append(self.date_val)
                                 self.writer.writerow(row_list)
+                                # Early-exit: stop processing this sheet once quota hit
+                                if self.early_exit > 0 and self.match_count >= self.early_exit:
+                                    log.info(f"[FILTER] ⚡ Within-sheet early-exit — "
+                                             f"hit {self.match_count}/{self.early_exit} matches in '{s_name}'. "
+                                             f"Stopping sheet scan.")
+                                    self._done = True
 
                     def finalize(self):
                         # Flush any remaining buffer content
@@ -644,7 +835,8 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
                             self._buf_parts = []
                             self._buf_len   = 0
 
-                f_output = FilteredOutput(writer, date_val, target_val, s_name)
+                f_output = FilteredOutput(writer, date_val, target_val, s_name,
+                                          early_exit=(early_exit_total - raw_matches_total) if is_raw_sheet else 0)
                 try:
                     xlsx2csv.Xlsx2csv(str(xlsx_path), skip_empty_lines=True).convert(f_output, sheetid=s_idx)
                     f_output.finalize()
@@ -653,6 +845,11 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
                         f"{f_output.row_count:,} rows scanned, "
                         f"{f_output.match_count:,} matches kept"
                     )
+                    # Accumulate raw sheet matches for cross-sheet early-exit
+                    if is_raw_sheet:
+                        raw_matches_total += f_output.match_count
+                        if early_exit_total > 0:
+                            log.info(f"[FILTER] 📊 Raw progress: {raw_matches_total}/{early_exit_total} matches across raw sheets")
                 except Exception as e:
                     log.error(f"[FILTER] ❌ Error on sheet index {s_idx}: {str(e)}")
                     traceback.print_exc()
@@ -669,7 +866,7 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
 # CORE DOWNLOAD + CONVERT (used by all endpoints)
 # =============================================================================
 
-def perform_conversion_from_url_with_filter(file_id: str, sheet_name: str | None, cache_path: Path, target_val: str, date_val: str | None, source_filename: str | None = None):
+def perform_conversion_from_url_with_filter(file_id: str, sheet_name: str | None, cache_path: Path, target_val: str, date_val: str | None, source_filename: str | None = None, job_id: str | None = None):
     """Downloads XLSX via the fixed download_drive_file(), then converts to CSV."""
     tmp_xlsx = CACHE_DIR / f"{file_id}.xlsx"
 
@@ -684,7 +881,7 @@ def perform_conversion_from_url_with_filter(file_id: str, sheet_name: str | None
             # Download with full large-file + confirm-token handling
             download_drive_file(file_id, tmp_xlsx)
 
-        convert_xlsx_to_csv(tmp_xlsx, sheet_name, cache_path, target_val, date_val, source_filename=source_filename)
+        convert_xlsx_to_csv(tmp_xlsx, sheet_name, cache_path, target_val, date_val, source_filename=source_filename, job_id=job_id)
 
     except Exception as e:
         if tmp_xlsx.exists():
@@ -863,7 +1060,7 @@ async def convert_async(
         active_jobs[job_id] = {"status": "done", "cache_path": str(cache_path), "error": None, "progress": "Cached"}
         return {"job_id": job_id, "status": "done"}
 
-    active_jobs[job_id] = {"status": "processing", "cache_path": str(cache_path), "error": None, "progress": "Starting..."}
+    active_jobs[job_id] = {"status": "processing", "cache_path": str(cache_path), "error": None, "progress": "Starting...", "created_at": time.time()}
     log.info(f"[ASYNC] Job {job_id}: starting background conversion for {file_id}")
 
     thread = threading.Thread(
@@ -876,9 +1073,16 @@ async def convert_async(
     return {"job_id": job_id, "status": "processing"}
 
 def background_conversion(job_id, file_id, sheet_name, cache_path, target_val, date_val, source_filename=None):
+    acquired = conversion_semaphore.acquire(timeout=1800)  # Wait up to 30 min for slot
+    if not acquired:
+        active_jobs[job_id]["status"] = "error"
+        active_jobs[job_id]["error"] = "Server busy: another conversion is running. Please retry."
+        active_jobs[job_id]["progress"] = "Failed: server busy"
+        log.error(f"[ASYNC] Job {job_id}: ❌ timed out waiting for conversion slot")
+        return
     try:
         active_jobs[job_id]["progress"] = "Downloading XLSX..."
-        perform_conversion_from_url_with_filter(file_id, sheet_name, cache_path, target_val, date_val, source_filename=source_filename)
+        perform_conversion_from_url_with_filter(file_id, sheet_name, cache_path, target_val, date_val, source_filename=source_filename, job_id=job_id)
         active_jobs[job_id]["status"] = "done"
         active_jobs[job_id]["progress"] = "Complete"
         log.info(f"[ASYNC] Job {job_id}: ✅ completed successfully")
@@ -888,6 +1092,8 @@ def background_conversion(job_id, file_id, sheet_name, cache_path, target_val, d
         active_jobs[job_id]["progress"] = f"Failed: {str(e)}"
         log.error(f"[ASYNC] Job {job_id}: ❌ failed — {str(e)}")
         traceback.print_exc()
+    finally:
+        conversion_semaphore.release()
 
 @app.get("/job/{job_id}")
 async def job_status(job_id: str):
