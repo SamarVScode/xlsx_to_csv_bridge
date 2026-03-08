@@ -506,7 +506,8 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
             for s in sheet_info:
                 target_indices.append(s['index'])
 
-        with open(csv_path, "w", encoding="utf-8", newline="") as f_out:
+        # Use a large write buffer on the file — reduces OS-level write syscalls significantly
+        with open(csv_path, "w", encoding="utf-8", newline="", buffering=256*1024) as f_out:
             writer = csv.writer(f_out)
             
             for s_idx in target_indices:
@@ -515,75 +516,112 @@ def convert_xlsx_to_csv(xlsx_path: Path, sheet_name_req: str | None, csv_path: P
                 
                 class FilteredOutput:
                     def __init__(self, csv_writer, date_val, target_val, sheet_name):
-                        self.writer = csv_writer
-                        self.date_val = date_val
-                        self.target_val = target_val
-                        self.sheet_name = sheet_name
-                        self.first_row_in_sheet = True
-                        self.target_col_idx = None
-                        self.row_count = 0
-                        self.match_count = 0
-                        self.line_buffer = ""
+                        self.writer       = csv_writer
+                        self.date_val     = date_val
+                        self.target_val   = target_val
+                        self.sheet_name   = sheet_name
+                        self.first_row    = True
+                        self.target_col   = None
+                        self.row_count    = 0
+                        self.match_count  = 0
+                        # ── KEY FIX: use a list instead of str += str ──
+                        # str concatenation creates a new object every call (O(n²)).
+                        # list.append + "".join is O(n) and allocates far less.
+                        self._buf_parts   = []
+                        self._buf_len     = 0
 
                     def write(self, data):
                         if isinstance(data, bytes):
                             data = data.decode('utf-8', errors='ignore')
-                        self.line_buffer += data
-                        if "\n" in self.line_buffer:
-                            parts = self.line_buffer.split("\n")
+
+                        # Accumulate in list — no string copies
+                        self._buf_parts.append(data)
+                        self._buf_len += len(data)
+
+                        # Only join + process when we have at least one newline
+                        # (avoids join cost on every tiny write from xlsx2csv)
+                        if '\n' not in data:
+                            return
+
+                        combined = ''.join(self._buf_parts)
+                        self._buf_parts = []
+                        self._buf_len   = 0
+
+                        if '\n' in combined:
+                            parts = combined.split('\n')
+                            # Everything except the last fragment is a complete line
                             for line in parts[:-1]:
-                                if line.strip():
+                                if line:   # skip blank lines fast (no .strip() cost)
                                     try:
-                                        f_line = io.StringIO(line)
-                                        reader = csv.reader(f_line)
-                                        row = next(reader)
-                                        self.process_row_data(row)
+                                        self.process_row_data(
+                                            next(csv.reader(io.StringIO(line)))
+                                        )
                                     except Exception:
                                         pass
-                            self.line_buffer = parts[-1]
+                            # Keep the trailing incomplete fragment
+                            remainder = parts[-1]
+                            if remainder:
+                                self._buf_parts.append(remainder)
+                                self._buf_len = len(remainder)
 
                     def process_row_data(self, row):
                         self.row_count += 1
-                        if self.row_count % 10000 == 0:
-                            log.info(f"[FILTER] ⏳ {s_name}: {self.row_count:,} rows processed, {self.match_count:,} matches so far")
-                        if not row: return
-                        
-                        if self.first_row_in_sheet:
-                            self.first_row_in_sheet = False
+
+                        # Log every 100k rows — 10k is too noisy for 250MB files
+                        if self.row_count % 100_000 == 0:
+                            log.info(
+                                f"[FILTER] ⏳ {s_name}: "
+                                f"{self.row_count:,} rows scanned, "
+                                f"{self.match_count:,} matches"
+                            )
+
+                        if not row:
+                            return
+
+                        if self.first_row:
+                            self.first_row = False
                             col_map = {str(h).strip(): i for i, h in enumerate(row) if h is not None}
-                            self.target_col_idx = col_map.get("Source_DC")
-                            if self.target_col_idx is None:
-                                self.target_col_idx = col_map.get("DC")
+                            self.target_col = col_map.get("Source_DC") if col_map.get("Source_DC") is not None else col_map.get("DC")
                             header_list = ["Sheet"] + list(row)
-                            if self.date_val: header_list.append("Date")
+                            if self.date_val:
+                                header_list.append("Date")
                             self.writer.writerow(header_list)
                             return
 
-                        if self.target_col_idx is not None and len(row) > self.target_col_idx:
-                            raw_val = row[self.target_col_idx]
-                            val = str(raw_val).strip() if raw_val is not None else ""
-                            if val == self.target_val:
+                        # Fast-path filter: avoid function call overhead on mismatch
+                        tc = self.target_col
+                        if tc is not None and len(row) > tc:
+                            val = row[tc]
+                            if val is not None and str(val).strip() == self.target_val:
                                 self.match_count += 1
                                 row_list = [s_name] + list(row)
-                                if self.date_val: row_list.append(self.date_val)
+                                if self.date_val:
+                                    row_list.append(self.date_val)
                                 self.writer.writerow(row_list)
-                    
+
                     def finalize(self):
-                        if self.line_buffer.strip():
-                            try:
-                                f_line = io.StringIO(self.line_buffer)
-                                reader = csv.reader(f_line)
-                                row = next(reader)
-                                self.process_row_data(row)
-                            except Exception:
-                                pass
-                        self.line_buffer = ""
+                        # Flush any remaining buffer content
+                        if self._buf_parts:
+                            remainder = ''.join(self._buf_parts)
+                            if remainder.strip():
+                                try:
+                                    self.process_row_data(
+                                        next(csv.reader(io.StringIO(remainder)))
+                                    )
+                                except Exception:
+                                    pass
+                            self._buf_parts = []
+                            self._buf_len   = 0
 
                 f_output = FilteredOutput(writer, date_val, target_val, s_name)
                 try:
                     xlsx2csv.Xlsx2csv(str(xlsx_path), skip_empty_lines=True).convert(f_output, sheetid=s_idx)
                     f_output.finalize()
-                    log.info(f"[FILTER] ✅ Done '{s_name}': {f_output.row_count:,} rows scanned, {f_output.match_count:,} matches kept")
+                    log.info(
+                        f"[FILTER] ✅ Done '{s_name}': "
+                        f"{f_output.row_count:,} rows scanned, "
+                        f"{f_output.match_count:,} matches kept"
+                    )
                 except Exception as e:
                     log.error(f"[FILTER] ❌ Error on sheet index {s_idx}: {str(e)}")
                     traceback.print_exc()
@@ -607,7 +645,7 @@ def perform_conversion_from_url_with_filter(file_id: str, sheet_name: str | None
     try:
         # Use cached XLSX if fresh
         if tmp_xlsx.exists() and (time.time() - tmp_xlsx.stat().st_mtime < CACHE_TTL):
-            log.info(f"[DOWNLOAD] Using cached XLSX for {file_id}")
+            log.info(f"[CACHE] Using cached source XLSX for {file_id}")
         else:
             # Delete stale cache if present
             if tmp_xlsx.exists():
