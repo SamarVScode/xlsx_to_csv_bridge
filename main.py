@@ -832,10 +832,10 @@ async def convert_post(
 @app.get("/convert-async")
 async def convert_async(
     drive_url: Optional[str] = Query(None),
-    sheet_name: Optional[str] = Query(None),   # single sheet (legacy)
-    sheet_names: Optional[str] = Query(None),  # comma-separated list e.g. "E2E_DC,Agent_view"
+    sheet_name: Optional[str] = Query(None),
     date_str: Optional[str] = Query(None),
     target_value: str = Query("MRZ"),
+    source_filename: Optional[str] = Query(None),  # filename passed by Apps Script for sameday detection
     x_api_key: Optional[str] = Header(None, alias="X-API-KEY"),
     api_key: Optional[str] = Query(None),
 ):
@@ -848,7 +848,13 @@ async def convert_async(
     file_id = extract_file_id(drive_url)
     job_id = str(uuid.uuid4())[:8]
 
-    cache_key_raw = f"{file_id}_{sheet_name}_{target_value}_{date_str}"
+    # Log whether sameday mode will be used
+    if source_filename:
+        log.info(f"[ASYNC] Job {job_id}: source_filename='{source_filename}' → sameday={is_sameday_file(source_filename)}")
+    else:
+        log.info(f"[ASYNC] Job {job_id}: no source_filename provided → ALL sheets mode")
+
+    cache_key_raw = f"{file_id}_{sheet_name}_{target_value}_{date_str}_{source_filename}"
     cache_key = hashlib.md5(cache_key_raw.encode()).hexdigest()
     cache_path = CACHE_DIR / f"{cache_key}.csv"
 
@@ -856,10 +862,6 @@ async def convert_async(
         log.info(f"[ASYNC] Job {job_id}: cache hit, returning done immediately")
         active_jobs[job_id] = {"status": "done", "cache_path": str(cache_path), "error": None, "progress": "Cached"}
         return {"job_id": job_id, "status": "done"}
-
-    # Extract filename from URL for sameday sheet detection
-    fname_match = re.search(r"([^/=&]+\.xlsx)", drive_url, re.IGNORECASE)
-    source_filename = fname_match.group(1) if fname_match else None
 
     active_jobs[job_id] = {"status": "processing", "cache_path": str(cache_path), "error": None, "progress": "Starting..."}
     log.info(f"[ASYNC] Job {job_id}: starting background conversion for {file_id}")
