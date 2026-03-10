@@ -519,9 +519,12 @@ def is_sameday_file(filename: str) -> bool:
     return "sameday" in (filename or "").lower()
 
 def is_d1_file(filename: str) -> bool:
-    """Returns True if the filename contains 'd-1' or 'd1' (case-insensitive)."""
+    """Returns True if the filename is a D-1 daily report.
+    Matches: 'Day-1', 'd-1', '_d1', '-d1' (case-insensitive).
+    Covers: 'E2E Day-1 Summary 07-Mar-2026 23hrs.xlsx' and temp file variants.
+    """
     fn = (filename or "").lower()
-    return "d-1" in fn or "_d1" in fn or "-d1" in fn
+    return "day-1" in fn or "d-1" in fn or "_d1" in fn or "-d1" in fn
 
 def extract_ofd_ofp_total(xlsx_path: Path, target_val: str = "MRZ") -> int:
     """
@@ -1057,7 +1060,8 @@ async def convert_async(
 
     # Log whether sameday mode will be used
     if source_filename:
-        log.info(f"[ASYNC] Job {job_id}: source_filename='{source_filename}' → sameday={is_sameday_file(source_filename)}")
+        mode = "SAMEDAY" if is_sameday_file(source_filename) else ("D-1" if is_d1_file(source_filename) else "ALL SHEETS")
+        log.info(f"[ASYNC] Job {job_id}: source_filename='{source_filename}' → mode={mode}")
     else:
         log.info(f"[ASYNC] Job {job_id}: no source_filename provided → ALL sheets mode")
 
